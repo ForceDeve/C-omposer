@@ -13,8 +13,9 @@
  * Want `fn` instead of `void`, `#` comments, or `loop` instead of `repeat`?
  * Change the tables below and rebuild; nothing else needs to change.
  *
- * NOTE: the music types and their fields mirror src/music_types.h; the
- * built-in functions are placeholders until the runtime exists.
+ * NOTE: note/scale/chord and their fields mirror lang/include/music.h.
+ * The other music types and most built-ins are placeholders until the
+ * interpreter exists.
  */
 #include "language.h"
 
@@ -25,23 +26,20 @@
 /*  Fields of the built-in music types (shown after '.' / '->')        */
 /* ------------------------------------------------------------------ */
 
-static const LangMember note_members[] = {
-    { "pitch",  "char", "MIDI pitch number (0-127, C4 = 60)" },
-    { "volume", "char", "Velocity / loudness (0-127)" },
-    { NULL }
-};
+/* note is a bare byte (uint8_t), so it has no fields. */
 
 static const LangMember scale_members[] = {
-    { "notes", "note*", "The notes that make up the scale" },
-    { "mode",  "char",  "Mode of the scale (MAJOR, MINOR, DORIAN, ...)" },
-    { "scale", "char",  "Scale identifier" },
+    { "root", "note",    "Root note of the scale" },
+    { "mode", "uint8_t", "Mode (IONIAN, DORIAN, ...); mode++ wraps around" },
+    { "kind", "uint8_t", "Scale family (SCALE_MAJOR, SCALE_PENTATONIC, ...)" },
     { NULL }
 };
 
 static const LangMember chord_members[] = {
-    { "root",    "note",  "Root note of the chord" },
-    { "notes",   "note*", "Notes of the chord, lowest first" },
-    { "quality", "char",  "Chord quality (MAJ, MIN, DIM, AUG, DOM7, ...)" },
+    { "notes", "note",    "Notes of the chord (up to 8), lowest first" },
+    { "count", "uint8_t", "Number of notes in the chord" },
+    { "root",  "uint8_t", "Root pitch class, computed from the notes (read-only)" },
+    { "name",  "char*",   "Chord symbol, computed from the notes: \"Am7\", \"G7(b9)\" (read-only)" },
     { NULL }
 };
 
@@ -106,6 +104,7 @@ static const LangWord words[] = {
     TYPE("void"), TYPE("char"), TYPE("short"), TYPE("int"), TYPE("long"),
     TYPE("float"), TYPE("double"), TYPE("signed"), TYPE("unsigned"),
     TYPE("bool"),
+    TYPE("uint8_t"), TYPE("int8_t"), TYPE("uint16_t"), TYPE("int16_t"),
 
     /* --- music keywords (semantics are up to the future runtime) ------ */
     { "repeat",   TOK_MUSIC_KEYWORD, "repeat (n) { }",
@@ -118,11 +117,11 @@ static const LangWord words[] = {
       "section $0 {\n\t\n}", NULL, NULL },
 
     /* --- music types -------------------------------------------------- */
-    { "note",       TOK_MUSIC_TYPE, "music type", "A single pitched note: pitch + volume.",
-      NULL, NULL, note_members },
-    { "scale",      TOK_MUSIC_TYPE, "music type", "A set of notes with a mode.",
+    { "note",       TOK_MUSIC_TYPE, "music type", "A pitch in one byte (MIDI number, C4 = 60). n++ is a semitone up.",
+      NULL, NULL, NULL },
+    { "scale",      TOK_MUSIC_TYPE, "music type", "Root + mode + kind (3 bytes); its notes are computed.",
       NULL, NULL, scale_members },
-    { "chord",      TOK_MUSIC_TYPE, "music type", "Several notes sounding together.",
+    { "chord",      TOK_MUSIC_TYPE, "music type", "Up to 8 notes; root and name are computed from them.",
       NULL, NULL, chord_members },
     { "duration",   TOK_MUSIC_TYPE, "music type", "A length of time measured in beats.",
       NULL, NULL, duration_members },
@@ -162,6 +161,14 @@ static const LangWord words[] = {
       "Distance between two notes in semitones.", "interval($0)", "int", NULL },
     { "midi",           TOK_BUILTIN, "note midi(int pitch)",
       "Make a note from a MIDI pitch number.", "midi($0)", "note", NULL },
+    { "scale_degree",   TOK_BUILTIN, "note scale_degree(scale s, int degree)",
+      "Note at a scale degree; degrees past the top continue an octave up.", "scale_degree($0)", "note", NULL },
+    { "mode_next",      TOK_BUILTIN, "void mode_next(scale *s)",
+      "Next mode, wrapping (LOCRIAN -> IONIAN).", "mode_next($0)", "void", NULL },
+    { "chord_from_scale", TOK_BUILTIN, "chord chord_from_scale(scale s, int degree, int size)",
+      "Stack thirds in a scale: size 3 = triad, 4 = seventh chord.", "chord_from_scale($0)", "chord", NULL },
+    { "chord_name",     TOK_BUILTIN, "char *chord_name(chord c)",
+      "Chord symbol computed from the notes.", "chord_name($0)", "char*", NULL },
     { "printf",         TOK_BUILTIN, "int printf(const char *fmt, ...)",
       "Print to the console (debugging).", "printf(\"$0\")", "int", NULL },
 
@@ -175,6 +182,14 @@ static const LangWord words[] = {
     CONST("PHRYGIAN", "mode", NULL),   CONST("LYDIAN", "mode", NULL),
     CONST("MIXOLYDIAN", "mode", NULL), CONST("AEOLIAN", "mode", NULL),
     CONST("LOCRIAN", "mode", NULL),
+
+    CONST("SCALE_MAJOR", "scale_kind", "Diatonic: the 7 church modes"),
+    CONST("SCALE_HARMONIC_MINOR", "scale_kind", NULL),
+    CONST("SCALE_MELODIC_MINOR", "scale_kind", NULL),
+    CONST("SCALE_PENTATONIC", "scale_kind", "Major pentatonic; mode 4 = minor pentatonic"),
+    CONST("SCALE_BLUES", "scale_kind", NULL),
+    CONST("SCALE_WHOLE_TONE", "scale_kind", NULL),
+    CONST("SCALE_CHROMATIC", "scale_kind", NULL),
 
     CONST("MAJ",  "quality", "Major triad"),
     CONST("MIN",  "quality", "Minor triad"),
