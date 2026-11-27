@@ -6,4 +6,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # lang/   — the language (name TBD: Csus/Cdim/...): interpreter, compiler, CLI
 # editor/ — C-omposer, the GTK4 editor (uses the interpreter for live mode)
+enable_testing()
+
+add_subdirectory(lang)
 add_subdirectory(editor)
