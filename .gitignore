@@ -1,0 +1,14 @@
+# Build output
+cmake-build-*/
+build/
+
+# IDE / local tool config
+.idea/
+.claude/settings.local.json
+.mcp.json
+
+# Rendered audio
+*.mp3
+*.wav
+*.flac
+*.ogg
