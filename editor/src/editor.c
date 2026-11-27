@@ -13,7 +13,28 @@
 #include "symbols.h"
 #include "theme.h"
 
+#include <math.h>
 #include <string.h>
+
+#include "source.h"
+
+#define VIZ_HEIGHT  92        /* inline visualiser, pixels */
+#define VIZ_GAP     10
+#define MAX_FUNCS   256
+
+/* What a //viz panel shows. */
+typedef struct {
+    GtkWidget *area;
+    float     *lo, *hi;      /* per-column min/max of the waveform */
+    int        n;
+    double     seconds;
+    float      peak;
+    char      *state;        /* "rendering…", an error, ... or NULL */
+    gint64     play_start;   /* monotonic µs, 0 = not playing */
+    guint      tick_id;
+    int        end_line;
+    int        y, width;     /* where it was last placed */
+} Viz;
 
 struct ComposerEditor {
     const Language *lang;
@@ -38,7 +59,26 @@ struct ComposerEditor {
 
     EditorCursorCallback cursor_cb;
     gpointer             cursor_data;
+
+    /* runnable functions, play buttons and //viz panels */
+    src_function         funcs[MAX_FUNCS];
+    int                  n_funcs;
+    int                  icon_width;
+    EditorPlayCallback   play_cb;
+    gpointer             play_data;
+    char                *busy_fn;       /* being built/rendered */
+    char                *playing_fn;
+    gboolean             viz_mode;
+    GHashTable          *viz;           /* name -> Viz* */
+    GtkTextTag          *viz_tag;       /* reserves space under a closing brace */
+    guint                viz_layout_id;
+    guint                viz_position_id;
+    GtkAdjustment       *vadj;          /* ref'd: we disconnect from it on destroy */
 };
+
+static void schedule_viz_layout(ComposerEditor *ed);
+static void viz_position(ComposerEditor *ed);
+static gboolean viz_position_idle(gpointer data);
 
 /* ------------------------------------------------------------------ */
 /*  Highlighting                                                        */
@@ -159,7 +199,36 @@ static void update_gutter_width(ComposerEditor *ed)
     int cw, ch;
     pango_layout_get_pixel_size(layout, &cw, &ch);
     g_object_unref(layout);
-    gtk_drawing_area_set_content_width(GTK_DRAWING_AREA(ed->gutter), (digits + 2) * cw);
+    ed->icon_width = 2 * cw + 6;
+    gtk_drawing_area_set_content_width(GTK_DRAWING_AREA(ed->gutter), (digits + 2) * cw + ed->icon_width);
+}
+
+static const src_function *playable_at_line(ComposerEditor *ed, int line)
+{
+    for (int i = 0; i < ed->n_funcs; i++)
+        if (ed->funcs[i].playable && ed->funcs[i].header_line == line)
+            return &ed->funcs[i];
+    return NULL;
+}
+
+/* ▶ play, ■ playing (click to stop), ◌ building */
+static void draw_play_icon(cairo_t *cr, double x, double y, double size, int state)
+{
+    if (state == 2) {                                   /* busy: three dots */
+        for (int i = 0; i < 3; i++) {
+            cairo_arc(cr, x + size * (0.2 + 0.3 * i), y + size / 2, size * 0.09, 0, 2 * G_PI);
+            cairo_fill(cr);
+        }
+    } else if (state == 1) {                            /* playing: stop square */
+        cairo_rectangle(cr, x + size * 0.18, y + size * 0.18, size * 0.64, size * 0.64);
+        cairo_fill(cr);
+    } else {                                            /* play triangle */
+        cairo_move_to(cr, x + size * 0.18, y + size * 0.1);
+        cairo_line_to(cr, x + size * 0.9, y + size * 0.5);
+        cairo_line_to(cr, x + size * 0.18, y + size * 0.9);
+        cairo_close_path(cr);
+        cairo_fill(cr);
+    }
 }
 
 static void draw_gutter(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer data)
@@ -197,6 +266,16 @@ static void draw_gutter(GtkDrawingArea *area, cairo_t *cr, int width, int height
         cairo_move_to(cr, width - tw - 8, wy);
         pango_cairo_show_layout(cr, layout);
 
+        const src_function *f = playable_at_line(ed, line);
+        if (f) {
+            int state = ed->busy_fn && !strcmp(ed->busy_fn, f->name) ? 2
+                      : ed->playing_fn && !strcmp(ed->playing_fn, f->name) ? 1 : 0;
+            GdkRGBA play;
+            gdk_rgba_parse(&play, state ? "#e5c07b" : "#7ec699");
+            gdk_cairo_set_source_rgba(cr, &play);
+            draw_play_icon(cr, 6, wy + (tht - tht * 0.8) / 2, tht * 0.8, state);
+        }
+
         if (!gtk_text_iter_forward_line(&it))
             break;
     }
@@ -215,7 +294,9 @@ static gboolean update_idle(gpointer data)
 
     if (ed->text_dirty) {
         relex(ed);
+        ed->n_funcs = src_scan_functions(ed->text, ed->funcs, MAX_FUNCS);
         ed->text_dirty = FALSE;
+        schedule_viz_layout(ed);
     }
     update_brackets(ed);
     update_gutter_width(ed);
@@ -564,6 +645,215 @@ static void on_scrolled(GtkAdjustment *adj, gpointer data)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Play buttons                                                        */
+/* ------------------------------------------------------------------ */
+
+static void on_gutter_click(GtkGestureClick *g, int n, double x, double y, gpointer data)
+{
+    (void)n;
+    ComposerEditor *ed = data;
+    if (x > ed->icon_width + 4) return;
+    int bx, by;
+    gtk_text_view_window_to_buffer_coords(ed->view, GTK_TEXT_WINDOW_LEFT, (int)x, (int)y, &bx, &by);
+    GtkTextIter it;
+    gtk_text_view_get_line_at_y(ed->view, &it, by, NULL);
+    const src_function *f = playable_at_line(ed, gtk_text_iter_get_line(&it));
+    if (f && ed->play_cb) {
+        gtk_gesture_set_state(GTK_GESTURE(g), GTK_EVENT_SEQUENCE_CLAIMED);
+        ed->play_cb(ed, f->name, ed->play_data);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  //viz panels                                                        */
+/* ------------------------------------------------------------------ */
+
+static void viz_free(gpointer p)
+{
+    Viz *v = p;
+    g_free(v->lo); g_free(v->hi); g_free(v->state);
+    g_free(v);
+}
+
+static void draw_viz(GtkDrawingArea *area, cairo_t *cr, int w, int h, gpointer data)
+{
+    (void)area;
+    Viz *v = data;
+    /* card */
+    double r = 6;
+    cairo_new_sub_path(cr);
+    cairo_arc(cr, w - r - 0.5, r + 0.5, r, -G_PI / 2, 0);
+    cairo_arc(cr, w - r - 0.5, h - r - 0.5, r, 0, G_PI / 2);
+    cairo_arc(cr, r + 0.5, h - r - 0.5, r, G_PI / 2, G_PI);
+    cairo_arc(cr, r + 0.5, r + 0.5, r, G_PI, 3 * G_PI / 2);
+    cairo_close_path(cr);
+    cairo_set_source_rgba(cr, 1, 1, 1, 0.045);
+    cairo_fill_preserve(cr);
+    cairo_set_source_rgba(cr, 1, 1, 1, 0.10);
+    cairo_set_line_width(cr, 1);
+    cairo_stroke(cr);
+
+    PangoLayout *layout = pango_cairo_create_layout(cr);
+    PangoFontDescription *font = pango_font_description_from_string("Sans 8");
+    pango_layout_set_font_description(layout, font);
+    pango_font_description_free(font);
+
+    double mid = h / 2.0 + 6, amp = (h - 26) / 2.0;
+    if (v->n > 0) {
+        /* centre line */
+        cairo_set_source_rgba(cr, 1, 1, 1, 0.12);
+        cairo_move_to(cr, 8, mid); cairo_line_to(cr, w - 8, mid); cairo_stroke(cr);
+        /* waveform */
+        double x0 = 8, ww = w - 16;
+        cairo_pattern_t *grad = cairo_pattern_create_linear(0, mid - amp, 0, mid + amp);
+        cairo_pattern_add_color_stop_rgba(grad, 0.0, 0.49, 0.78, 0.60, 0.95);
+        cairo_pattern_add_color_stop_rgba(grad, 0.5, 0.38, 0.69, 0.94, 0.95);
+        cairo_pattern_add_color_stop_rgba(grad, 1.0, 0.49, 0.78, 0.60, 0.95);
+        cairo_set_source(cr, grad);
+        cairo_move_to(cr, x0, mid - v->hi[0] * amp);
+        for (int i = 1; i < v->n; i++) cairo_line_to(cr, x0 + ww * i / (v->n - 1), mid - v->hi[i] * amp);
+        for (int i = v->n - 1; i >= 0; i--) cairo_line_to(cr, x0 + ww * i / (v->n - 1), mid - v->lo[i] * amp);
+        cairo_close_path(cr);
+        cairo_fill(cr);
+        cairo_pattern_destroy(grad);
+
+        /* playhead */
+        if (v->play_start) {
+            double t = (g_get_monotonic_time() - v->play_start) / 1e6;
+            if (t <= v->seconds) {
+                double px = x0 + ww * t / v->seconds;
+                cairo_set_source_rgba(cr, 0.9, 0.75, 0.48, 0.95);
+                cairo_set_line_width(cr, 1.5);
+                cairo_move_to(cr, px, 16); cairo_line_to(cr, px, h - 4); cairo_stroke(cr);
+            }
+        }
+        char info[96];
+        g_snprintf(info, sizeof info, "%.2f s   peak %.1f dBFS", v->seconds,
+                   v->peak > 0 ? 20 * log10(v->peak) : -120.0);
+        pango_layout_set_text(layout, info, -1);
+        cairo_set_source_rgba(cr, 1, 1, 1, 0.45);
+        cairo_move_to(cr, 10, 3);
+        pango_cairo_show_layout(cr, layout);
+    }
+    if (v->state || v->n == 0) {
+        pango_layout_set_text(layout, v->state ? v->state : "waiting for a render…", -1);
+        int tw, th;
+        pango_layout_get_pixel_size(layout, &tw, &th);
+        cairo_set_source_rgba(cr, 1, 1, 1, 0.55);
+        cairo_move_to(cr, v->n ? w - tw - 10 : (w - tw) / 2.0, v->n ? 3 : (h - th) / 2.0);
+        pango_cairo_show_layout(cr, layout);
+    }
+    g_object_unref(layout);
+}
+
+static Viz *viz_get(ComposerEditor *ed, const char *name)
+{
+    Viz *v = g_hash_table_lookup(ed->viz, name);
+    if (v) return v;
+    v = g_new0(Viz, 1);
+    v->area = gtk_drawing_area_new();
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(v->area), draw_viz, v, NULL);
+    gtk_widget_set_size_request(v->area, 400, VIZ_HEIGHT);
+    gtk_widget_set_can_target(v->area, FALSE);           /* clicks go to the text */
+    gtk_text_view_add_overlay(ed->view, v->area, 0, 0);
+    gtk_widget_set_visible(v->area, FALSE);
+    g_hash_table_insert(ed->viz, g_strdup(name), v);
+    return v;
+}
+
+static gboolean viz_layout(gpointer data)
+{
+    ComposerEditor *ed = data;
+    ed->viz_layout_id = 0;
+
+    GtkTextIter s, e;
+    gtk_text_buffer_get_bounds(ed->buffer, &s, &e);
+    gtk_text_buffer_remove_tag(ed->buffer, ed->viz_tag, &s, &e);
+
+    GHashTableIter hi;
+    gpointer key, val;
+    g_hash_table_iter_init(&hi, ed->viz);
+    while (g_hash_table_iter_next(&hi, &key, &val))
+        ((Viz *)val)->end_line = -1;
+
+    if (ed->viz_mode) {
+        for (int i = 0; i < ed->n_funcs; i++) {
+            if (!ed->funcs[i].viz) continue;
+            Viz *v = viz_get(ed, ed->funcs[i].name);
+            v->end_line = ed->funcs[i].end_line;
+            GtkTextIter a, b;
+            gtk_text_buffer_get_iter_at_line(ed->buffer, &a, v->end_line);
+            b = a;
+            if (!gtk_text_iter_ends_line(&b)) gtk_text_iter_forward_to_line_end(&b);
+            gtk_text_buffer_apply_tag(ed->buffer, ed->viz_tag, &a, &b);
+        }
+    }
+
+    viz_position(ed);
+    /* line heights settle after GTK re-lays out the text: place again then */
+    if (!ed->viz_position_id)
+        ed->viz_position_id = g_timeout_add(120, viz_position_idle, ed);
+    return G_SOURCE_REMOVE;
+}
+
+/* Place the panels in the space their tag reserves. Runs again whenever the
+ * text view re-lays out (line heights are only right after that). */
+static void viz_position(ComposerEditor *ed)
+{
+    GHashTableIter hi;
+    gpointer key, val;
+    GdkRectangle vis;
+    gtk_text_view_get_visible_rect(ed->view, &vis);
+    int width = MAX(vis.width - 40, 320);
+    g_hash_table_iter_init(&hi, ed->viz);
+    while (g_hash_table_iter_next(&hi, &key, &val)) {
+        Viz *v = val;
+        if (v->end_line < 0) { gtk_widget_set_visible(v->area, FALSE); continue; }
+        GtkTextIter it;
+        int y, h;
+        gtk_text_buffer_get_iter_at_line(ed->buffer, &it, v->end_line);
+        gtk_text_view_get_line_yrange(ed->view, &it, &y, &h);
+        int top = y + h - VIZ_HEIGHT - VIZ_GAP / 2;
+        if (top != v->y || width != v->width || !gtk_widget_get_visible(v->area)) {
+            v->y = top; v->width = width;
+            gtk_widget_set_size_request(v->area, width, VIZ_HEIGHT);
+            gtk_text_view_move_overlay(ed->view, v->area, 14, top);
+            gtk_widget_set_visible(v->area, TRUE);
+        }
+    }
+}
+
+static gboolean viz_position_idle(gpointer data)
+{
+    ComposerEditor *ed = data;
+    ed->viz_position_id = 0;
+    viz_position(ed);
+    gtk_widget_queue_draw(ed->gutter);
+    return G_SOURCE_REMOVE;
+}
+
+/* Emitted from inside size allocation: only schedule the move for after it. */
+static void on_layout_changed(GtkAdjustment *adj, gpointer data)
+{
+    (void)adj;
+    ComposerEditor *ed = data;
+    if (!ed->viz_position_id)
+        ed->viz_position_id = g_idle_add(viz_position_idle, ed);
+}
+
+static void schedule_viz_layout(ComposerEditor *ed)
+{
+    if (!ed->viz_layout_id)
+        ed->viz_layout_id = g_idle_add_full(G_PRIORITY_LOW, viz_layout, ed, NULL);
+}
+
+static void on_view_resize(GObject *o, GParamSpec *ps, gpointer data)
+{
+    (void)o; (void)ps;
+    schedule_viz_layout(data);
+}
+
+/* ------------------------------------------------------------------ */
 /*  Lifetime                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -572,6 +862,15 @@ static void editor_free(gpointer data)
     ComposerEditor *ed = data;
     if (ed->update_id)
         g_source_remove(ed->update_id);
+    if (ed->viz_layout_id)
+        g_source_remove(ed->viz_layout_id);
+    if (ed->viz_position_id)
+        g_source_remove(ed->viz_position_id);
+    g_hash_table_unref(ed->viz);
+    g_free(ed->busy_fn);
+    g_free(ed->playing_fn);
+    g_object_unref(ed->buffer);
+    g_object_unref(ed->vadj);
     completion_free(ed->completion);
     symbols_free(ed->symbols);
     if (ed->tokens)
@@ -585,9 +884,25 @@ static void on_destroy(GtkWidget *w, gpointer data)
     (void)w;
     ComposerEditor *ed = data;
     g_signal_handlers_disconnect_by_data(ed->buffer, ed);
+    g_signal_handlers_disconnect_by_data(ed->vadj, ed);
     if (ed->update_id) {
         g_source_remove(ed->update_id);
         ed->update_id = 0;
+    }
+    if (ed->viz_layout_id) {
+        g_source_remove(ed->viz_layout_id);
+        ed->viz_layout_id = 0;
+    }
+    if (ed->viz_position_id) {
+        g_source_remove(ed->viz_position_id);
+        ed->viz_position_id = 0;
+    }
+    GHashTableIter hi;
+    gpointer key, val;
+    g_hash_table_iter_init(&hi, ed->viz);
+    while (g_hash_table_iter_next(&hi, &key, &val)) {
+        Viz *v = val;
+        if (v->tick_id) { gtk_widget_remove_tick_callback(v->area, v->tick_id); v->tick_id = 0; }
     }
 }
 
@@ -598,7 +913,8 @@ ComposerEditor *composer_editor_new(const Language *lang)
 
     ed->buffer = gtk_text_buffer_new(NULL);
     ed->view   = GTK_TEXT_VIEW(gtk_text_view_new_with_buffer(ed->buffer));
-    g_object_unref(ed->buffer);   /* owned by the view */
+    /* the view owns the buffer; keep our own reference so it outlives the
+     * view during teardown (we disconnect from it in on_destroy) */
 
     gtk_text_view_set_monospace(ed->view, TRUE);
     gtk_text_view_set_wrap_mode(ed->view, GTK_WRAP_NONE);
@@ -615,12 +931,23 @@ ComposerEditor *composer_editor_new(const Language *lang)
     gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(ed->gutter), draw_gutter, ed, NULL);
     gtk_text_view_set_gutter(ed->view, GTK_TEXT_WINDOW_LEFT, ed->gutter);
 
+    GtkGesture *gclick = gtk_gesture_click_new();
+    g_signal_connect(gclick, "pressed", G_CALLBACK(on_gutter_click), ed);
+    gtk_widget_add_controller(ed->gutter, GTK_EVENT_CONTROLLER(gclick));
+
+    ed->viz = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, viz_free);
+    ed->viz_tag = gtk_text_buffer_create_tag(ed->buffer, "viz-space",
+                                             "pixels-below-lines", VIZ_HEIGHT + VIZ_GAP, NULL);
+    g_signal_connect(ed->view, "notify::width", G_CALLBACK(on_view_resize), ed);
+
     ed->scroller = gtk_scrolled_window_new();
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(ed->scroller), GTK_WIDGET(ed->view));
     gtk_widget_set_vexpand(ed->scroller, TRUE);
     gtk_widget_set_hexpand(ed->scroller, TRUE);
-    g_signal_connect(gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(ed->scroller)),
-                     "value-changed", G_CALLBACK(on_scrolled), ed);
+    ed->vadj = g_object_ref(gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(ed->scroller)));
+    g_signal_connect(ed->vadj, "value-changed", G_CALLBACK(on_scrolled), ed);
+    /* "changed" = the document height changed, i.e. lines were re-laid out */
+    g_signal_connect(ed->vadj, "changed", G_CALLBACK(on_layout_changed), ed);
 
     ed->completion = completion_new(ed->view);
 
@@ -678,3 +1005,109 @@ void composer_editor_set_cursor_callback(ComposerEditor *ed, EditorCursorCallbac
     ed->cursor_cb = cb;
     ed->cursor_data = user_data;
 }
+
+/* ------------------------------------------------------------------ */
+/*  Running functions                                                   */
+/* ------------------------------------------------------------------ */
+
+void composer_editor_set_play_callback(ComposerEditor *ed, EditorPlayCallback cb, gpointer user_data)
+{
+    ed->play_cb = cb;
+    ed->play_data = user_data;
+}
+
+int composer_editor_functions(ComposerEditor *ed, const src_function **out)
+{
+    if (ed->text_dirty) {                      /* make sure the list is current */
+        char *text = composer_editor_get_text(ed);  /* (ed->text backs the tokens: leave it) */
+        ed->n_funcs = src_scan_functions(text, ed->funcs, MAX_FUNCS);
+        g_free(text);
+    }
+    *out = ed->funcs;
+    return ed->n_funcs;
+}
+
+void composer_editor_set_viz_mode(ComposerEditor *ed, gboolean on)
+{
+    ed->viz_mode = on;
+    schedule_viz_layout(ed);
+}
+
+void composer_editor_set_busy(ComposerEditor *ed, const char *function)
+{
+    g_free(ed->busy_fn);
+    ed->busy_fn = g_strdup(function);
+    gtk_widget_queue_draw(ed->gutter);
+}
+
+void composer_editor_set_viz_state(ComposerEditor *ed, const char *function, const char *state)
+{
+    Viz *v = viz_get(ed, function);
+    g_free(v->state);
+    v->state = g_strdup(state);
+    gtk_widget_queue_draw(v->area);
+}
+
+void composer_editor_set_viz_audio(ComposerEditor *ed, const char *function,
+                                   const float *l, const float *r, guint frames, guint rate)
+{
+    Viz *v = viz_get(ed, function);
+    g_free(v->lo); g_free(v->hi);
+    v->n = 600;
+    v->lo = g_new0(float, v->n);
+    v->hi = g_new0(float, v->n);
+    v->peak = 0;
+    v->seconds = rate ? (double)frames / rate : 0;
+    for (int c = 0; c < v->n; c++) {
+        guint a = (guint)((guint64)frames * c / v->n), b = (guint)((guint64)frames * (c + 1) / v->n);
+        float lo = 0, hi = 0;
+        for (guint i = a; i < b; i++) {
+            float x = (l[i] + r[i]) * 0.5f;
+            if (x < lo) lo = x;
+            if (x > hi) hi = x;
+            v->peak = MAX(v->peak, MAX(fabsf(l[i]), fabsf(r[i])));
+        }
+        v->lo[c] = lo; v->hi[c] = hi;
+    }
+    /* draw the shape at full height; the label shows the real level */
+    float m = 0;
+    for (int c = 0; c < v->n; c++) m = MAX(m, MAX(-v->lo[c], v->hi[c]));
+    if (m > 1e-6f)
+        for (int c = 0; c < v->n; c++) { v->lo[c] /= m; v->hi[c] /= m; }
+    g_free(v->state);
+    v->state = NULL;
+    gtk_widget_queue_draw(v->area);
+}
+
+static gboolean viz_tick(GtkWidget *w, GdkFrameClock *clock, gpointer data)
+{
+    (void)clock;
+    Viz *v = data;
+    gtk_widget_queue_draw(w);
+    if (!v->play_start || (g_get_monotonic_time() - v->play_start) / 1e6 > v->seconds) {
+        v->tick_id = 0;
+        return G_SOURCE_REMOVE;
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+void composer_editor_set_playing(ComposerEditor *ed, const char *function)
+{
+    /* stop the previous playhead */
+    if (ed->playing_fn) {
+        Viz *old = g_hash_table_lookup(ed->viz, ed->playing_fn);
+        if (old) { old->play_start = 0; gtk_widget_queue_draw(old->area); }
+    }
+    g_free(ed->playing_fn);
+    ed->playing_fn = g_strdup(function);
+    if (function) {
+        Viz *v = g_hash_table_lookup(ed->viz, function);
+        if (v && v->n) {
+            v->play_start = g_get_monotonic_time();
+            if (!v->tick_id) v->tick_id = gtk_widget_add_tick_callback(v->area, viz_tick, v, NULL);
+        }
+    }
+    gtk_widget_queue_draw(ed->gutter);
+}
+
+const char *composer_editor_playing(ComposerEditor *ed) { return ed->playing_fn; }

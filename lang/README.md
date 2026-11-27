@@ -26,6 +26,14 @@ Still to flesh out: chord names in other tunings use the nearest 12-tone reading
 
 Tests: `ctest` from the build dir, or `./build/lang/test_music`.
 
+## The prelude (`include/composer.h`)
+
+Every song gets: `play(sound)`, `layer`, `rest(ticks)`, `tempo(bpm)`, `beep(note, len)`, `beep_chord`, `synth(PATCH_…, part)`, `drum_machine(KIT_…, part)`, `load_sample(path)`, `pattern("x...", KICK)`, `one_note`, `one_chord`, `chord_of(n, …)`, `mix`, `then`, `repeat`, plus all of `audio.h` and `music.h`.
+
+Language extras are translated to C on the same lines (`src/source.c`): note literals `C4 F#3 Bb2` → MIDI numbers, `1b` → `BEATS(1)`, `2bars` → `BARS(2)`, `250ms` → `MS(250)`, `2s` → `SECONDS(2)`, `120bpm` → `120`.
+
+`composerc` (`tools/composerc.c`) builds a song: `composerc song.cmp -o song.mp3`, `--call fn`, `--list`, `--emit-c`.
+
 ## Program structure
 
 A song is a C-style program. `main()` takes no arguments (nothing to pass to an mp3); it plays sections in order. Sections, instruments and effects are ordinary functions, and they compose:
