@@ -32,12 +32,14 @@ static const LangMember scale_members[] = {
     { "root", "note",    "Root note of the scale" },
     { "mode", "uint8_t", "Mode (IONIAN, DORIAN, ...); mode++ wraps around" },
     { "kind", "uint8_t", "Scale family (SCALE_MAJOR, SCALE_PENTATONIC, ...)" },
+    { "edo",  "uint8_t", "Tuning: steps per octave (0 = 12; try 31)" },
     { NULL }
 };
 
 static const LangMember chord_members[] = {
     { "notes", "note",    "Notes of the chord (up to 8), lowest first" },
     { "count", "uint8_t", "Number of notes in the chord" },
+    { "edo",   "uint8_t", "Tuning of the notes (0 = 12)" },
     { "root",  "uint8_t", "Root pitch class, computed from the notes (read-only)" },
     { "name",  "char*",   "Chord symbol, computed from the notes: \"Am7\", \"G7(b9)\" (read-only)" },
     { NULL }
@@ -169,6 +171,12 @@ static const LangWord words[] = {
       "Stack thirds in a scale: size 3 = triad, 4 = seventh chord.", "chord_from_scale($0)", "chord", NULL },
     { "chord_name",     TOK_BUILTIN, "char *chord_name(chord c)",
       "Chord symbol computed from the notes.", "chord_name($0)", "char*", NULL },
+    { "edo_note",       TOK_BUILTIN, "note edo_note(uint8_t edo, int fifths, int octave)",
+      "A spelled note in a tuning: fifths from C (G=1, F=-1, F#=6, Db=-5).", "edo_note($0)", "note", NULL },
+    { "edo_c4",         TOK_BUILTIN, "note edo_c4(uint8_t edo)",
+      "Middle C in a tuning (60 in 12-EDO, 124 in 31-EDO).", "edo_c4($0)", "note", NULL },
+    { "note_freq_edo",  TOK_BUILTIN, "double note_freq_edo(note n, uint8_t edo)",
+      "Frequency in Hz of a note in a tuning.", "note_freq_edo($0)", "double", NULL },
     { "printf",         TOK_BUILTIN, "int printf(const char *fmt, ...)",
       "Print to the console (debugging).", "printf(\"$0\")", "int", NULL },
 
@@ -190,6 +198,7 @@ static const LangWord words[] = {
     CONST("SCALE_BLUES", "scale_kind", NULL),
     CONST("SCALE_WHOLE_TONE", "scale_kind", NULL),
     CONST("SCALE_CHROMATIC", "scale_kind", NULL),
+    CONST("SCALE_EDO_ALL", "scale_kind", "Every step of the tuning (31 notes in 31-EDO)"),
 
     CONST("MAJ",  "quality", "Major triad"),
     CONST("MIN",  "quality", "Minor triad"),

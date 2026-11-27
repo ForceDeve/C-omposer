@@ -30,24 +30,128 @@ char *note_name(note n, char *buf, size_t size)
 }
 
 /* ------------------------------------------------------------------ */
+/*  tuning (EDO)                                                       */
+/* ------------------------------------------------------------------ */
+
+static int mod(int a, int n) { int r = a % n; return r < 0 ? r + n : r; }
+static int floor_div(int a, int n) { return (a - mod(a, n)) / n; }
+
+note edo_c4(uint8_t edo)
+{
+    int e = edo_of(edo);
+    return (note)(e == 12 ? 60 : e * (128 / e));
+}
+
+double edo_c4_freq(void) { return 440.0 * pow(2.0, -9.0 / 12.0); }
+
+int edo_fifth(uint8_t edo)
+{
+    int e = edo_of(edo);
+    return (int)(e * 0.58496250072115618 + 0.5);   /* log2(3/2) */
+}
+
+int edo_chromatic(uint8_t edo)
+{
+    return 7 * edo_fifth(edo) - 4 * edo_of(edo);
+}
+
+double edo_cents(int steps, uint8_t edo) { return steps * 1200.0 / edo_of(edo); }
+
+/* Steps above C (same octave) of the natural letter that a chain-of-fifths
+ * position belongs to, and how many sharps (+) / flats (-) it carries. */
+static void split_fifths(int fifths, int *letter_fifths, int *accidentals)
+{
+    *letter_fifths = mod(fifths + 1, 7) - 1;          /* F=-1, C=0 .. B=5 */
+    *accidentals = (fifths - *letter_fifths) / 7;
+}
+
+note edo_note(uint8_t edo, int fifths, int octave)
+{
+    int e = edo_of(edo), lf, acc;
+    split_fifths(fifths, &lf, &acc);
+    int letter = mod(lf * edo_fifth(edo), e);
+    return (note)(edo_c4(edo) + (octave - 4) * e + letter + acc * edo_chromatic(edo));
+}
+
+double note_freq_edo(note n, uint8_t edo)
+{
+    return edo_c4_freq() * pow(2.0, ((int)n - edo_c4(edo)) / (double)edo_of(edo));
+}
+
+/* Chain-of-fifths position spelling pitch class pc (steps above C), with
+ * at most two sharps/flats; fewest fifths from C wins. -100 = none. */
+static int spell(int pc, uint8_t edo)
+{
+    int e = edo_of(edo), f = edo_fifth(edo);
+    for (int d = 0; d <= 19; d++) {
+        for (int sign = 1; sign >= -1; sign -= 2) {
+            int k = d * sign, lf, acc;
+            split_fifths(k, &lf, &acc);
+            if (acc >= -2 && acc <= 2 && mod(k * f, e) == pc)
+                return k;
+            if (d == 0) break;
+        }
+    }
+    return -100;
+}
+
+char *note_name_edo(note n, uint8_t edo, char *buf, size_t size)
+{
+    int e = edo_of(edo);
+    if (e == 12)
+        return note_name(n, buf, size);
+
+    int rel = (int)n - edo_c4(edo);
+    int pc = mod(rel, e);
+
+    /* on the chain of fifths, or the nearest spelled note plus ups/downs */
+    int k = spell(pc, edo), ups = 0;
+    for (int d = 1; k == -100 && d <= e / 2; d++) {
+        if ((k = spell(mod(pc - d, e), edo)) != -100) ups = d;
+        else if ((k = spell(mod(pc + d, e), edo)) != -100) ups = -d;
+    }
+    if (k == -100) {                                   /* degenerate tuning */
+        snprintf(buf, size, "%d", n);
+        return buf;
+    }
+
+    int lf, acc;
+    split_fifths(k, &lf, &acc);
+    int base = edo_note(edo, k, 4) - edo_c4(edo) + ups;   /* offset of the spelling in octave 4 */
+    int octave = 4 + floor_div(rel - base, e);
+
+    char marks[16] = "";
+    size_t m = 0;
+    for (int i = 0; i < (acc > 0 ? acc : -acc) && m < 4; i++) marks[m++] = acc > 0 ? '#' : 'b';
+    for (int i = 0; i < (ups > 0 ? ups : -ups) && m < 12; i++) marks[m++] = ups > 0 ? '^' : 'v';
+    marks[m] = '\0';
+    snprintf(buf, size, "%c%s%d", "FCGDAEB"[lf + 1], marks, octave);
+    return buf;
+}
+
+/* ------------------------------------------------------------------ */
 /*  scale                                                              */
 /* ------------------------------------------------------------------ */
 
-/* Semitone steps between consecutive degrees; each row sums to 12. */
+/* Each degree is spelled as a chain-of-fifths position (C=0, G=1, F=-1),
+ * so the same scale lands correctly in any tuning: E is 4 fifths up,
+ * which is 4 semitones in 12-EDO and 10 steps in 31-EDO. */
 typedef struct {
-    const char   *name;
-    uint8_t       size;
-    const uint8_t steps[12];
+    const char  *name;
+    uint8_t      size;
+    const int8_t fifths[12];
 } scale_def;
 
 static const scale_def scale_defs[SCALE_KIND_COUNT] = {
-    [SCALE_MAJOR]          = { "major",          7, {2, 2, 1, 2, 2, 2, 1} },
-    [SCALE_HARMONIC_MINOR] = { "harmonic minor", 7, {2, 1, 2, 2, 1, 3, 1} },
-    [SCALE_MELODIC_MINOR]  = { "melodic minor",  7, {2, 1, 2, 2, 2, 2, 1} },
-    [SCALE_PENTATONIC]     = { "pentatonic",     5, {2, 2, 3, 2, 3} },
-    [SCALE_BLUES]          = { "blues",          6, {3, 2, 1, 1, 3, 2} },
-    [SCALE_WHOLE_TONE]     = { "whole tone",     6, {2, 2, 2, 2, 2, 2} },
-    [SCALE_CHROMATIC]      = { "chromatic",     12, {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1} },
+    /*                                         C  D  E  F  G  A  B           */
+    [SCALE_MAJOR]          = { "major",          7, {0, 2, 4, -1, 1, 3, 5} },
+    [SCALE_HARMONIC_MINOR] = { "harmonic minor", 7, {0, 2, -3, -1, 1, -4, 5} },
+    [SCALE_MELODIC_MINOR]  = { "melodic minor",  7, {0, 2, -3, -1, 1, 3, 5} },
+    [SCALE_PENTATONIC]     = { "pentatonic",     5, {0, 2, 4, 1, 3} },
+    [SCALE_BLUES]          = { "blues",          6, {0, -3, -1, 6, 1, -2} },
+    [SCALE_WHOLE_TONE]     = { "whole tone",     6, {0, 2, 4, 6, 8, 10} },
+    [SCALE_CHROMATIC]      = { "chromatic",     12, {0, 7, 2, -3, 4, -1, 6, 1, -4, 3, -2, 5} },
+    [SCALE_EDO_ALL]        = { "all steps",      0, {0} },     /* size = edo */
 };
 
 static const scale_def *def_of(const scale *s)
@@ -55,7 +159,11 @@ static const scale_def *def_of(const scale *s)
     return &scale_defs[s->kind < SCALE_KIND_COUNT ? s->kind : SCALE_CHROMATIC];
 }
 
-uint8_t scale_size(const scale *s) { return def_of(s)->size; }
+uint8_t scale_size(const scale *s)
+{
+    const scale_def *d = def_of(s);
+    return d->size ? d->size : edo_of(s->edo);
+}
 
 void mode_next(scale *s) { s->mode = (uint8_t)((s->mode + 1) % scale_size(s)); }
 
@@ -68,13 +176,18 @@ void mode_prev(scale *s)
 note scale_degree(const scale *s, int degree)
 {
     const scale_def *d = def_of(s);
-    int n = d->size;
-    int octave = degree >= 0 ? degree / n : -((-degree + n - 1) / n);
+    int n = scale_size(s), e = edo_of(s->edo);
+    int octave = floor_div(degree, n);
     int index = degree - octave * n;            /* 0 .. n-1 */
-    int offset = 0;
-    for (int k = 0; k < index; k++)
-        offset += d->steps[(s->mode + k) % n];
-    return (note)(s->root + 12 * octave + offset);
+    int offset;
+    if (!d->size) {
+        offset = index;                         /* every step of the tuning */
+    } else {
+        int m = s->mode % n;
+        int k = d->fifths[(m + index) % n] - d->fifths[m];
+        offset = mod(k * edo_fifth(s->edo), e);
+    }
+    return (note)(s->root + e * octave + offset);
 }
 
 const char *scale_mode_name(const scale *s, char *buf, size_t size)
@@ -84,8 +197,11 @@ const char *scale_mode_name(const scale *s, char *buf, size_t size)
         "mixolydian", "aeolian (minor)", "locrian"
     };
     const scale_def *d = def_of(s);
-    uint8_t m = s->mode % d->size;
+    uint8_t m = s->mode % scale_size(s);
     const char *special = NULL;
+    int e = edo_of(s->edo);
+    char tuning[16] = "";
+    if (e != 12) snprintf(tuning, sizeof tuning, " (%d-EDO)", e);
 
     if (d == &scale_defs[SCALE_MAJOR])                     special = church[m];
     else if (d == &scale_defs[SCALE_PENTATONIC] && m == 4) special = "minor pentatonic";
@@ -93,9 +209,10 @@ const char *scale_mode_name(const scale *s, char *buf, size_t size)
     else if (d == &scale_defs[SCALE_MELODIC_MINOR] && m == 3)  special = "lydian dominant";
     else if (d == &scale_defs[SCALE_MELODIC_MINOR] && m == 6)  special = "altered";
 
-    if (special)       snprintf(buf, size, "%s", special);
-    else if (m == 0)   snprintf(buf, size, "%s", d->name);
-    else               snprintf(buf, size, "%s mode %d", d->name, m + 1);
+    if (!d->size)      snprintf(buf, size, "%d-EDO all steps", e);
+    else if (special)  snprintf(buf, size, "%s%s", special, tuning);
+    else if (m == 0)   snprintf(buf, size, "%s%s", d->name, tuning);
+    else               snprintf(buf, size, "%s mode %d%s", d->name, m + 1, tuning);
     return buf;
 }
 
@@ -106,11 +223,19 @@ const char *scale_mode_name(const scale *s, char *buf, size_t size)
 /* Extra bit beyond the public EXT_* ones: a b7 next to a maj7. */
 #define EXT_ADD_FLAT7 (1 << 7)
 
+/* A chord note as the nearest 12-tone MIDI pitch (identity in 12-EDO). */
+static int as_12(const chord *c, int i)
+{
+    int e = edo_of(c->edo);
+    if (e == 12) return c->notes[i];
+    return 60 + (int)lround(((int)c->notes[i] - edo_c4(c->edo)) * 12.0 / e);
+}
+
 static uint16_t pc_mask(const chord *c)
 {
     uint16_t m = 0;
     for (int i = 0; i < c->count && i < CHORD_MAX; i++)
-        m |= (uint16_t)(1u << note_pitch_class(c->notes[i]));
+        m |= (uint16_t)(1u << mod(as_12(c, i), 12));
     return m;
 }
 
@@ -193,10 +318,10 @@ int chord_analyze(const chord *c, chord_info *out)
     if (!mask)
         return -1;
 
-    note low = 255;
+    int low = 1 << 30;
     for (int i = 0; i < c->count && i < CHORD_MAX; i++)
-        if (c->notes[i] < low) low = c->notes[i];
-    uint8_t bass = note_pitch_class(low);
+        if (as_12(c, i) < low) low = as_12(c, i);
+    uint8_t bass = (uint8_t)mod(low, 12);
 
     int best_cost = 1 << 30;
     for (int r = 0; r < 12; r++) {
@@ -352,7 +477,7 @@ void chord_add(chord *c, note n)
 
 chord chord_from_scale(const scale *s, int degree, int size)
 {
-    chord c = {0};
+    chord c = { .edo = s->edo };
     if (size < 1) size = 1;
     if (size > CHORD_MAX) size = CHORD_MAX;
     for (int i = 0; i < size; i++)
