@@ -73,7 +73,7 @@ struct ComposerEditor {
     GtkTextTag          *viz_tag;       /* reserves space under a closing brace */
     guint                viz_layout_id;
     guint                viz_position_id;
-    GtkAdjustment       *vadj;          /* ref'd: we disconnect from it on destroy */
+    GtkAdjustment       *vadj, *hadj;   /* ref'd: we disconnect from them on destroy */
 };
 
 static void schedule_viz_layout(ComposerEditor *ed);
@@ -641,7 +641,12 @@ static void on_focus_leave(GtkEventControllerFocus *f, gpointer data)
 static void on_scrolled(GtkAdjustment *adj, gpointer data)
 {
     (void)adj;
-    gtk_widget_queue_draw(((ComposerEditor *)data)->gutter);
+    ComposerEditor *ed = data;
+    gtk_widget_queue_draw(ed->gutter);
+    /* the //viz panels are placed in window coordinates (GTK 4.8 doesn't
+     * scroll overlay children), so follow the text ourselves */
+    if (g_hash_table_size(ed->viz))
+        viz_position(ed);
 }
 
 /* ------------------------------------------------------------------ */
@@ -813,11 +818,12 @@ static void viz_position(ComposerEditor *ed)
         int y, h;
         gtk_text_buffer_get_iter_at_line(ed->buffer, &it, v->end_line);
         gtk_text_view_get_line_yrange(ed->view, &it, &y, &h);
-        int top = y + h - VIZ_HEIGHT - VIZ_GAP / 2;
+        int top_buffer = y + h - VIZ_HEIGHT - VIZ_GAP / 2, top, x;
+        gtk_text_view_buffer_to_window_coords(ed->view, GTK_TEXT_WINDOW_TEXT, 14, top_buffer, &x, &top);
         if (top != v->y || width != v->width || !gtk_widget_get_visible(v->area)) {
             v->y = top; v->width = width;
             gtk_widget_set_size_request(v->area, width, VIZ_HEIGHT);
-            gtk_text_view_move_overlay(ed->view, v->area, 14, top);
+            gtk_text_view_move_overlay(ed->view, v->area, x, top);
             gtk_widget_set_visible(v->area, TRUE);
         }
     }
@@ -871,6 +877,7 @@ static void editor_free(gpointer data)
     g_free(ed->playing_fn);
     g_object_unref(ed->buffer);
     g_object_unref(ed->vadj);
+    g_object_unref(ed->hadj);
     completion_free(ed->completion);
     symbols_free(ed->symbols);
     if (ed->tokens)
@@ -885,6 +892,7 @@ static void on_destroy(GtkWidget *w, gpointer data)
     ComposerEditor *ed = data;
     g_signal_handlers_disconnect_by_data(ed->buffer, ed);
     g_signal_handlers_disconnect_by_data(ed->vadj, ed);
+    g_signal_handlers_disconnect_by_data(ed->hadj, ed);
     if (ed->update_id) {
         g_source_remove(ed->update_id);
         ed->update_id = 0;
@@ -948,6 +956,8 @@ ComposerEditor *composer_editor_new(const Language *lang)
     g_signal_connect(ed->vadj, "value-changed", G_CALLBACK(on_scrolled), ed);
     /* "changed" = the document height changed, i.e. lines were re-laid out */
     g_signal_connect(ed->vadj, "changed", G_CALLBACK(on_layout_changed), ed);
+    ed->hadj = g_object_ref(gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(ed->scroller)));
+    g_signal_connect(ed->hadj, "value-changed", G_CALLBACK(on_scrolled), ed);
 
     ed->completion = completion_new(ed->view);
 
