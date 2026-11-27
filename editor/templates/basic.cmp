@@ -1,0 +1,7 @@
+#include <composer.h>
+
+int main(void) {
+    printf("Hello, World!\n");
+    play(beep(C4, 1b));
+    return 0;
+}

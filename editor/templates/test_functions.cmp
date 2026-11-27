@@ -1,0 +1,64 @@
+#include <composer.h>
+
+/*
+ * Test functions.
+ *   ▶ in the margin plays a function on its own. Functions that take a
+ *     note or a chord are played with C4 / a C major chord.
+ *   //viz after a function's closing brace shows its sound right under it
+ *     (Interpreter mode).
+ */
+
+/* A plain beep, one beat long. */
+sound hello_beep(void) {
+    return beep(C4, 1b);
+} //viz
+
+/* Any note: ▶ plays it with C4. */
+sound pluck(note n) {
+    return synth(PATCH_PLUCK, one_note(n, 1b));
+}
+
+/* Any chord: ▶ plays it with C major. */
+sound pad(chord c) {
+    return fx_reverb(synth(PATCH_WARM_PAD, one_chord(c, 4b)), 0.8, 4.0, 0.5, 0.35);
+} //viz
+
+/* A chord on its own is played as a beep chord. */
+chord a_minor_seventh(void) {
+    return chord_of(4, A3, C4, E4, G4);
+}
+
+/* A melody: its notes are played with a plain beep. */
+part arpeggio(void) {
+    part p = part_new(2bars);
+    note line[8] = { C4, E4, G4, B4, C5, B4, G4, E4 };
+    for (int i = 0; i < 8; i++)
+        part_note(&p, BEATS(i * 0.5), 0.5b, line[i], 100);
+    return p;
+}
+
+sound beat(void) {
+    part p = pattern("x...x...x...x...", KICK);
+    part_pattern(&p, "....x.......x...", CLAP, 0.25b, 100);
+    part_pattern(&p, "..x...x...x...x.", HAT, 0.25b, 90);
+    return repeat(drum_machine(KIT_808, p), 2);
+} //viz
+
+sound acid(void) {
+    part p = part_new(2bars);
+    note line[8] = { A1, A1, A2, A1, C2, A1, G2, A1 };
+    for (int i = 0; i < 16; i++)
+        part_note(&p, BEATS(i * 0.5), 0.4b, line[i % 8], i % 4 == 0 ? 127 : 90);
+    return fx_delay(synth(PATCH_ACID_BASS, p), 0.75b, 0.3, 0.5, 0.25, true);
+} //viz
+
+sound chorus(void) {
+    return mix(beat(), mix(acid(), pad(chord_of(4, A3, C4, E4, G4))));
+} //viz
+
+int main(void) {
+    tempo(124bpm);
+    play(hello_beep());
+    play(chorus());
+    return 0;
+}
