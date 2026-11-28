@@ -34,4 +34,6 @@ add_executable(C_omposer
 )
 target_link_libraries(C_omposer PRIVATE PkgConfig::GTK4 lang_music)
 target_compile_options(C_omposer PRIVATE -Wall -Wextra)
-target_compile_definitions(C_omposer PRIVATE COMPOSER_THEME_DIR="${CMAKE_CURRENT_SOURCE_DIR}/themes")
+target_compile_definitions(C_omposer PRIVATE
+        COMPOSER_THEME_DIR="${CMAKE_CURRENT_SOURCE_DIR}/themes"
+        COMPOSER_ICON_DIR="${CMAKE_CURRENT_SOURCE_DIR}/icons")

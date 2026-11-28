@@ -471,6 +471,7 @@ void theme_install_css(void)
         ".composer-sidebar row { padding: 2px 4px; }\n"
         ".composer-sidebar .dim-label { color: %s; }\n"
         ".composer-prefs { padding: 16px; }\n"
+        "button.composer-mode-on { background-color: alpha(%s, 0.35); }\n"
         ".composer-prefs .heading { font-weight: bold; margin-top: 8px; }\n",
         t->font_family, t->font_size_pt, t->background,
         t->background, t->foreground, t->caret,
@@ -486,7 +487,8 @@ void theme_install_css(void)
         t->panel_bg, t->window_fg,
         muted, t->window_bg,
         t->panel_bg, t->window_fg,
-        muted);
+        muted,
+        t->accent);
 
     for (int c = 0; c < TOK_COUNT; c++)
         g_string_append_printf(css, ".completion .kind-%s { color: %s; }\n",

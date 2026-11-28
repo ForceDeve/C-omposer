@@ -9,10 +9,8 @@ A C-like language for music composition, and the editor built for it.
 
 ## Using the editor
 
-- **Templates ▾**: *Basic C program* (the default: `#include`, `main`, hello world) or *Test functions*. Unsaved work is never replaced: a template opens in a new window instead.
-- **Interpreter / Compiler** switch in the header bar:
-  - *Interpreter*: live. `//viz` after a function's closing brace shows its waveform under it, re-rendered ~1 s after you stop typing. **Run (F5)** plays `main()`.
-  - *Compiler*: **Build (F5)** compiles the whole song to an audio file (mp3, wav, flac, ogg, opus, m4a; chosen by the extension).
+- **Header bar**: **▶** runs `main()` live in the interpreter (F5); **🔨** compiles the song to an audio file and plays it (Ctrl+B; asks where once, *☰ → Export audio as…* to change; mp3, wav, flac, ogg, opus or m4a by extension); **■** stops. The lit button is the current mode: in interpreter mode `//viz` panels and background visuals stay live as you type.
+- **Templates** live in *☰ → New from template*: *Basic C program* (the default), *Test functions*, and your own. *Save this file as a template…* adds one to `~/.config/c-omposer/templates/`. Unsaved work is never replaced: a template opens in a new window instead.
 - **▶ in the margin** plays any function on its own: no arguments, or only `note`/`chord` arguments (played with C4 / a C major chord). Functions returning a `part`, `note` or `chord` are played with a plain beep. Click ■ to stop.
 - **Output** panel: compiler errors (pointing at your file and line), `printf` output, render times.
 

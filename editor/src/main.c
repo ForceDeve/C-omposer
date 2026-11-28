@@ -30,8 +30,10 @@ typedef struct {
     /* running code */
     Runner         *runner;
     RunMode         mode;
-    GtkWidget      *run_button;
-    GtkWidget      *interp_toggle, *compile_toggle;
+    GtkWidget      *play_button;     /* ▶ run in the interpreter          */
+    GtkWidget      *build_button;    /* 🔨 compile to an audio file and play it */
+    char           *export_path;     /* where 🔨 writes; asked for once     */
+    GMenu          *template_menu;   /* rebuilt when templates change       */
     GtkTextBuffer  *output;
     GtkWidget      *output_view;
     guint           live_timer;
@@ -43,6 +45,7 @@ typedef struct {
 } ComposerWindow;
 
 static GList *all_windows;          /* ComposerWindow*: settings apply to every window */
+static GList *all_windows_for_templates(void) { return all_windows; }
 
 /* Templates, generated at build time from the .cmp files in editor/templates. */
 extern const char TEMPLATE_basic[];
@@ -300,19 +303,188 @@ static void act_new(GSimpleAction *a, GVariant *p, gpointer data)
     composer_window_new(w->app, NULL);         /* starts from the basic template */
 }
 
+/* Your own templates: ~/.config/c-omposer/templates/<name>.cmp */
+static char *user_template_dir(void)
+{
+    char *dir = settings_dir();
+    char *t = g_build_filename(dir, "templates", NULL);
+    g_free(dir);
+    return t;
+}
+
+static void use_template_text(ComposerWindow *w, const char *text)
+{
+    /* never throw away unsaved work: open it in a new window instead */
+    ComposerWindow *t = gtk_text_buffer_get_modified(composer_editor_buffer(w->editor)) || w->file
+                      ? composer_window_new(w->app, NULL) : w;
+    composer_editor_set_text(t->editor, text);
+    update_title(t);
+}
+
+/* id: a built-in's id, or "user:<file name>" */
 static void act_template(GSimpleAction *a, GVariant *p, gpointer data)
 {
     (void)a;
     ComposerWindow *w = data;
     const char *id = g_variant_get_string(p, NULL);
-    for (size_t i = 0; i < G_N_ELEMENTS(templates); i++) {
-        if (strcmp(templates[i].id, id)) continue;
-        /* never throw away unsaved work: open it in a new window instead */
-        ComposerWindow *t = gtk_text_buffer_get_modified(composer_editor_buffer(w->editor)) || w->file
-                          ? composer_window_new(w->app, NULL) : w;
-        composer_editor_set_text(t->editor, templates[i].text);
-        update_title(t);
+    if (g_str_has_prefix(id, "user:")) {
+        char *dir = user_template_dir();
+        char *path = g_build_filename(dir, id + 5, NULL);
+        char *text = NULL;
+        if (g_file_get_contents(path, &text, NULL, NULL) && g_utf8_validate(text, -1, NULL))
+            use_template_text(w, text);
+        else
+            set_status(w, "Couldn't read that template");
+        g_free(text); g_free(path); g_free(dir);
+        return;
     }
+    for (size_t i = 0; i < G_N_ELEMENTS(templates); i++)
+        if (!strcmp(templates[i].id, id)) use_template_text(w, templates[i].text);
+}
+
+static int by_string(gconstpointer a, gconstpointer b)
+{
+    return g_utf8_collate(*(char *const *)a, *(char *const *)b);
+}
+
+static void fill_template_menu(GMenu *m)
+{
+    g_menu_remove_all(m);
+    GMenu *builtin = g_menu_new();
+    for (size_t i = 0; i < G_N_ELEMENTS(templates); i++) {
+        char *action = g_strdup_printf("win.template::%s", templates[i].id);
+        g_menu_append(builtin, templates[i].label, action);
+        g_free(action);
+    }
+    g_menu_append_section(m, NULL, G_MENU_MODEL(builtin));
+    g_object_unref(builtin);
+
+    GMenu *mine = g_menu_new();
+    char *dir = user_template_dir();
+    GDir *d = g_dir_open(dir, 0, NULL);
+    GPtrArray *names = g_ptr_array_new_with_free_func(g_free);
+    const char *f;
+    while (d && (f = g_dir_read_name(d)))
+        if (g_str_has_suffix(f, ".cmp")) g_ptr_array_add(names, g_strdup(f));
+    if (d) g_dir_close(d);
+    g_ptr_array_sort(names, by_string);
+    for (guint i = 0; i < names->len; i++) {
+        const char *file = names->pdata[i];
+        char *label = g_strndup(file, strlen(file) - 4);
+        for (char *c = label; *c; c++) if (*c == '_') *c = ' ';
+        GMenuItem *it = g_menu_item_new(NULL, NULL);
+        g_menu_item_set_label(it, label);                 /* plain label: no mnemonic games */
+        g_menu_item_set_action_and_target_value(it, "win.template", g_variant_new_printf("user:%s", file));
+        g_menu_append_item(mine, it);
+        g_object_unref(it);
+        g_free(label);
+    }
+    g_ptr_array_unref(names);
+    g_free(dir);
+    g_menu_append_section(m, NULL, G_MENU_MODEL(mine));
+    g_object_unref(mine);
+
+    GMenu *manage = g_menu_new();
+    g_menu_append(manage, "Save this file as a template…", "win.save-template");
+    g_menu_append(manage, "Open my templates folder", "win.open-templates");
+    g_menu_append_section(m, NULL, G_MENU_MODEL(manage));
+    g_object_unref(manage);
+}
+
+static GList *all_windows_for_templates(void);
+
+static void refresh_template_menus(void)
+{
+    for (GList *l = all_windows_for_templates(); l; l = l->next)
+        fill_template_menu(((ComposerWindow *)l->data)->template_menu);
+}
+
+/* "Save as template": a small name prompt */
+typedef struct { ComposerWindow *w; GtkWidget *dialog, *entry; } TemplatePrompt;
+
+static void save_template_now(GtkWidget *button, gpointer data)
+{
+    (void)button;
+    TemplatePrompt *tp = data;
+    const char *name = gtk_editable_get_text(GTK_EDITABLE(tp->entry));
+    char *clean = g_strstrip(g_strdup(name));
+    if (*clean) {
+        for (char *c = clean; *c; c++)
+            if (*c == '/' || *c == '\\' || *c == ' ') *c = '_';
+        char *dir = user_template_dir();
+        g_mkdir_with_parents(dir, 0755);
+        char *file = g_strconcat(clean, ".cmp", NULL);
+        char *path = g_build_filename(dir, file, NULL);
+        char *text = composer_editor_get_text(tp->w->editor);
+        GError *err = NULL;
+        if (g_file_set_contents(path, text, -1, &err)) {
+            char *msg = g_strdup_printf("Saved template \"%s\"", name);
+            set_status(tp->w, msg);
+            g_free(msg);
+            refresh_template_menus();
+        } else {
+            set_status(tp->w, err->message);
+            g_error_free(err);
+        }
+        g_free(text); g_free(path); g_free(file); g_free(dir);
+    }
+    g_free(clean);
+    gtk_window_destroy(GTK_WINDOW(tp->dialog));
+}
+
+static void template_prompt_free(gpointer data) { g_free(data); }
+
+static void act_save_template(GSimpleAction *a, GVariant *p, gpointer data)
+{
+    (void)a; (void)p;
+    ComposerWindow *w = data;
+    TemplatePrompt *tp = g_new0(TemplatePrompt, 1);
+    tp->w = w;
+    tp->dialog = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(tp->dialog), "Save as template");
+    gtk_window_set_transient_for(GTK_WINDOW(tp->dialog), GTK_WINDOW(w->window));
+    gtk_window_set_modal(GTK_WINDOW(tp->dialog), TRUE);
+    gtk_window_set_default_size(GTK_WINDOW(tp->dialog), 360, -1);
+    g_object_set_data_full(G_OBJECT(tp->dialog), "prompt", tp, template_prompt_free);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_add_css_class(box, "composer-prefs");
+    GtkWidget *label = gtk_label_new("Template name (it shows up under ☰ → New from template):");
+    gtk_label_set_xalign(GTK_LABEL(label), 0);
+    gtk_label_set_wrap(GTK_LABEL(label), TRUE);
+    tp->entry = gtk_entry_new();
+    char *base = w->file ? g_file_get_basename(w->file) : g_strdup("my template.cmp");
+    char *dot = strrchr(base, '.');
+    if (dot) *dot = '\0';
+    gtk_editable_set_text(GTK_EDITABLE(tp->entry), base);
+    g_free(base);
+    GtkWidget *buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_set_halign(buttons, GTK_ALIGN_END);
+    GtkWidget *cancel = gtk_button_new_with_label("Cancel");
+    GtkWidget *save = gtk_button_new_with_label("Save");
+    gtk_widget_add_css_class(save, "suggested-action");
+    g_signal_connect_swapped(cancel, "clicked", G_CALLBACK(gtk_window_destroy), tp->dialog);
+    g_signal_connect(save, "clicked", G_CALLBACK(save_template_now), tp);
+    g_signal_connect(tp->entry, "activate", G_CALLBACK(save_template_now), tp);
+    gtk_box_append(GTK_BOX(buttons), cancel);
+    gtk_box_append(GTK_BOX(buttons), save);
+    gtk_box_append(GTK_BOX(box), label);
+    gtk_box_append(GTK_BOX(box), tp->entry);
+    gtk_box_append(GTK_BOX(box), buttons);
+    gtk_window_set_child(GTK_WINDOW(tp->dialog), box);
+    gtk_window_present(GTK_WINDOW(tp->dialog));
+}
+
+static void act_open_templates(GSimpleAction *a, GVariant *p, gpointer data)
+{
+    (void)a; (void)p;
+    ComposerWindow *w = data;
+    char *dir = user_template_dir();
+    g_mkdir_with_parents(dir, 0755);
+    char *uri = g_filename_to_uri(dir, NULL, NULL);
+    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+    gtk_show_uri(GTK_WINDOW(w->window), uri, GDK_CURRENT_TIME);
+    G_GNUC_END_IGNORE_DEPRECATIONS
+    g_free(uri); g_free(dir);
 }
 
 /* ------------------------------------------------------------------ */
@@ -544,8 +716,17 @@ static void export_rendered(gboolean ok, const char *out, const char *path, gpoi
         char *label = source_label(w);
         char *msg = g_strdup_printf("Wrote %s\n(from a terminal: composerc %s -o %s)", path, label, path);
         output_append(w, msg);
-        set_status(w, "Exported");
+        set_status(w, "Compiled");
         g_free(msg); g_free(label);
+        /* 🔨 = compile and run: play what was just written */
+        char *err = NULL;
+        if (runner_play(w->runner, path, playback_ended, w, &err)) {
+            composer_editor_set_playing(w->editor, "main");
+            set_status(w, "Compiled · playing");
+        } else {
+            output_append(w, err);
+            g_free(err);
+        }
     } else {
         set_status(w, "Export failed — see Output");
     }
@@ -565,16 +746,28 @@ static void export_built(gboolean ok, const char *log, gpointer data)
     runner_render(j->w->runner, "main", j->path, export_rendered, j);
 }
 
+static void compile_to(ComposerWindow *w, const char *path);
+
 static void start_export(ComposerWindow *w, GFile *file)
 {
     char *path = g_file_get_path(file);
     if (!path) return;
+    g_free(w->export_path);
+    w->export_path = g_strdup(path);           /* 🔨 reuses it from now on */
+    compile_to(w, path);
+    g_free(path);
+}
+
+static void compile_to(ComposerWindow *w, const char *path)
+{
+    runner_stop(w->runner);
+    composer_editor_set_playing(w->editor, NULL);
     output_heading(w, "Compiling to %s", path);
     set_status(w, "Compiling…");
     char *text = composer_editor_get_text(w->editor);
     char *label = source_label(w);
     runner_build(w->runner, text, label, export_built, job_new(w, "main", path));
-    g_free(text); g_free(label); g_free(path);
+    g_free(text); g_free(label);
 }
 
 static char *export_name(ComposerWindow *w)
@@ -627,19 +820,41 @@ static void show_export_dialog(ComposerWindow *w)
 }
 #endif
 
+static void set_mode(ComposerWindow *w, RunMode mode);
+
+/* ▶ : interpreter mode, run main() */
 static void act_run(GSimpleAction *a, GVariant *p, gpointer data)
 {
     (void)a; (void)p;
     ComposerWindow *w = data;
-    if (w->mode == MODE_COMPILER) {
-        show_export_dialog(w);
-        return;
-    }
+    set_mode(w, MODE_INTERPRETER);
     if (!find_function(w, "main")) {
         set_status(w, "No main() to run");
         return;
     }
     play_function(w, "main");
+}
+
+/* 🔨 : compiler mode, build the song to an audio file and play it */
+static void act_build(GSimpleAction *a, GVariant *p, gpointer data)
+{
+    (void)a; (void)p;
+    ComposerWindow *w = data;
+    set_mode(w, MODE_COMPILER);
+    if (!find_function(w, "main")) {
+        set_status(w, "No main() to compile");
+        return;
+    }
+    if (w->export_path) compile_to(w, w->export_path);
+    else                show_export_dialog(w);       /* first time: where to? */
+}
+
+static void act_export_as(GSimpleAction *a, GVariant *p, gpointer data)
+{
+    (void)a; (void)p;
+    ComposerWindow *w = data;
+    set_mode(w, MODE_COMPILER);
+    show_export_dialog(w);
 }
 
 /* ---- interpreter mode: keep //viz panels live ----------------------- */
@@ -748,18 +963,15 @@ static void set_mode(ComposerWindow *w, RunMode mode)
     w->mode = mode;
     composer_editor_set_viz_mode(w->editor, mode == MODE_INTERPRETER);
     visuals_set_active(composer_editor_visuals(w->editor), mode == MODE_INTERPRETER);
-    gtk_button_set_label(GTK_BUTTON(w->run_button), mode == MODE_INTERPRETER ? "▶  Run" : "⤓  Build");
-    gtk_widget_set_tooltip_text(w->run_button, mode == MODE_INTERPRETER
-        ? "Run main() and play it (F5)"
-        : "Compile the song to an audio file: mp3, wav, flac, ogg… (F5)");
-    if (mode == MODE_INTERPRETER) schedule_live_update(w, 50);
-}
-
-static void on_mode_toggled(GtkToggleButton *b, gpointer data)
-{
-    ComposerWindow *w = data;
-    if (!gtk_toggle_button_get_active(b)) return;
-    set_mode(w, GTK_WIDGET(b) == w->interp_toggle ? MODE_INTERPRETER : MODE_COMPILER);
+    /* the button of the current mode is lit */
+    if (mode == MODE_INTERPRETER) {
+        gtk_widget_add_css_class(w->play_button, "composer-mode-on");
+        gtk_widget_remove_css_class(w->build_button, "composer-mode-on");
+        schedule_live_update(w, 50);
+    } else {
+        gtk_widget_add_css_class(w->build_button, "composer-mode-on");
+        gtk_widget_remove_css_class(w->play_button, "composer-mode-on");
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -945,6 +1157,8 @@ static void composer_window_free(gpointer data)
     if (w->live_timer) g_source_remove(w->live_timer);
     runner_free(w->runner);
     g_ptr_array_unref(w->viz_queue);
+    g_free(w->export_path);
+    g_clear_object(&w->template_menu);
     g_clear_object(&w->file);
     g_free(w);
 }
@@ -964,6 +1178,10 @@ static ComposerWindow *composer_window_new(GtkApplication *app, GFile *file)
         { .name = "save-as", .activate = act_save_as },
         { .name = "template", .activate = act_template, .parameter_type = "s" },
         { .name = "run",      .activate = act_run      },
+        { .name = "build",    .activate = act_build    },
+        { .name = "export-as", .activate = act_export_as },
+        { .name = "save-template", .activate = act_save_template },
+        { .name = "open-templates", .activate = act_open_templates },
         { .name = "stop",     .activate = act_stop     },
         { .name = "clear-output", .activate = act_clear_output },
         { .name = "preferences",  .activate = act_prefs },
@@ -992,44 +1210,34 @@ static ComposerWindow *composer_window_new(GtkApplication *app, GFile *file)
     gtk_widget_set_tooltip_text(open, "Open (Ctrl+O)");
     gtk_header_bar_pack_start(GTK_HEADER_BAR(header), open);
 
-    GMenu *tmenu = g_menu_new();
-    for (size_t i = 0; i < G_N_ELEMENTS(templates); i++) {
-        char *action = g_strdup_printf("win.template::%s", templates[i].id);
-        g_menu_append(tmenu, templates[i].label, action);
-        g_free(action);
-    }
-    GtkWidget *tbtn = gtk_menu_button_new();
-    gtk_menu_button_set_label(GTK_MENU_BUTTON(tbtn), "Templates");
-    gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(tbtn), G_MENU_MODEL(tmenu));
-    gtk_widget_set_tooltip_text(tbtn, "Start from a template (unsaved work opens in a new window)");
-    g_object_unref(tmenu);
-    gtk_header_bar_pack_start(GTK_HEADER_BAR(header), tbtn);
-
-    /* Interpreter | Compiler, Run, Stop */
-    GtkWidget *modes = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    gtk_widget_add_css_class(modes, "linked");
-    w->interp_toggle = gtk_toggle_button_new_with_label("Interpreter");
-    w->compile_toggle = gtk_toggle_button_new_with_label("Compiler");
-    gtk_toggle_button_set_group(GTK_TOGGLE_BUTTON(w->compile_toggle), GTK_TOGGLE_BUTTON(w->interp_toggle));
-    gtk_widget_set_tooltip_text(w->interp_toggle, "Live: //viz panels update as you type, ▶ plays functions");
-    gtk_widget_set_tooltip_text(w->compile_toggle, "Build the whole song into an audio file");
-    gtk_box_append(GTK_BOX(modes), w->interp_toggle);
-    gtk_box_append(GTK_BOX(modes), w->compile_toggle);
-    gtk_header_bar_pack_start(GTK_HEADER_BAR(header), modes);
-
-    w->run_button = gtk_button_new_with_label("▶  Run");
-    gtk_actionable_set_action_name(GTK_ACTIONABLE(w->run_button), "win.run");
-    gtk_widget_add_css_class(w->run_button, "suggested-action");
-    gtk_header_bar_pack_start(GTK_HEADER_BAR(header), w->run_button);
+    /* ▶ run (interpreter) · 🔨 compile & run · ■ stop */
+    GtkWidget *runbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_add_css_class(runbox, "linked");
+    w->play_button = gtk_button_new_from_icon_name("media-playback-start-symbolic");
+    gtk_actionable_set_action_name(GTK_ACTIONABLE(w->play_button), "win.run");
+    gtk_widget_set_tooltip_text(w->play_button, "Run main() live in the interpreter (F5)\n//viz panels and ▶ buttons stay live as you type");
+    w->build_button = gtk_button_new_from_icon_name("composer-hammer-symbolic");
+    gtk_actionable_set_action_name(GTK_ACTIONABLE(w->build_button), "win.build");
+    gtk_widget_set_tooltip_text(w->build_button, "Compile the song to an audio file and play it (Ctrl+B)\nAsks where the first time; ☰ → Export as… to change");
+    gtk_box_append(GTK_BOX(runbox), w->play_button);
+    gtk_box_append(GTK_BOX(runbox), w->build_button);
     GtkWidget *stop = gtk_button_new_from_icon_name("media-playback-stop-symbolic");
     gtk_actionable_set_action_name(GTK_ACTIONABLE(stop), "win.stop");
     gtk_widget_set_tooltip_text(stop, "Stop (Shift+F5)");
-    gtk_header_bar_pack_start(GTK_HEADER_BAR(header), stop);
+    gtk_box_append(GTK_BOX(runbox), stop);
+    gtk_header_bar_pack_start(GTK_HEADER_BAR(header), runbox);
 
     GMenu *menu = g_menu_new();
     g_menu_append(menu, "New window", "win.new");
     g_menu_append(menu, "Save as…", "win.save-as");
+    g_menu_append(menu, "Export audio as…", "win.export-as");
     g_menu_append(menu, "Clear output", "win.clear-output");
+    w->template_menu = g_menu_new();
+    fill_template_menu(w->template_menu);
+    GMenu *tsec = g_menu_new();
+    g_menu_append_submenu(tsec, "New from template", G_MENU_MODEL(w->template_menu));
+    g_menu_append_section(menu, NULL, G_MENU_MODEL(tsec));
+    g_object_unref(tsec);
     GMenu *proj = g_menu_new();
     g_menu_append(proj, "New project…", "win.new-project");
     g_menu_append(proj, "Open project folder…", "win.open-project");
@@ -1112,8 +1320,6 @@ static ComposerWindow *composer_window_new(GtkApplication *app, GFile *file)
     composer_editor_set_cursor_callback(w->editor, on_cursor, w);
     composer_editor_set_play_callback(w->editor, on_play_clicked, w);
     g_signal_connect(composer_editor_buffer(w->editor), "changed", G_CALLBACK(on_text_changed), w);
-    g_signal_connect(w->interp_toggle, "toggled", G_CALLBACK(on_mode_toggled), w);
-    g_signal_connect(w->compile_toggle, "toggled", G_CALLBACK(on_mode_toggled), w);
     g_signal_connect(w->sidebar_toggle, "toggled", G_CALLBACK(on_sidebar_toggled), w);
     Settings *st = settings_get();
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(w->sidebar_toggle), st->sidebar);
@@ -1125,7 +1331,7 @@ static ComposerWindow *composer_window_new(GtkApplication *app, GFile *file)
     if (!file || !load_file(w, file))
         composer_editor_set_text(w->editor, templates[0].text);
     update_title(w);
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(w->interp_toggle), TRUE);   /* -> set_mode */
+    set_mode(w, MODE_INTERPRETER);
     apply_visual_settings(w);
 
     gtk_window_present(GTK_WINDOW(w->window));
@@ -1138,6 +1344,8 @@ static ComposerWindow *composer_window_new(GtkApplication *app, GFile *file)
 static void on_startup(GApplication *app, gpointer data)
 {
     (void)data;
+    gtk_icon_theme_add_search_path(gtk_icon_theme_get_for_display(gdk_display_get_default()),
+                                   COMPOSER_ICON_DIR);        /* the hammer */
     if (!theme_apply(settings_get()->theme))       /* CSS, colours, light/dark */
         theme_apply("c-omposer-dark");
 
@@ -1147,6 +1355,7 @@ static void on_startup(GApplication *app, gpointer data)
         { "win.save",    "<Ctrl>s" },
         { "win.save-as", "<Ctrl><Shift>s" },
         { "win.run",     "F5" },
+        { "win.build",   "<Ctrl>b" },
         { "win.stop",    "<Shift>F5" },
         { "win.toggle-sidebar", "F9" },
         { "win.preferences", "<Ctrl>comma" },
