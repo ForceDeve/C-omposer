@@ -24,16 +24,13 @@
 
 /* What a //viz panel shows. */
 typedef struct {
-    GtkWidget *area;
     float     *lo, *hi;      /* per-column min/max of the waveform */
     int        n;
     double     seconds;
     float      peak;
     char      *state;        /* "rendering…", an error, ... or NULL */
     gint64     play_start;   /* monotonic µs, 0 = not playing */
-    guint      tick_id;
-    int        end_line;
-    int        y, width;     /* where it was last placed */
+    int        end_line;     /* line of the closing brace, -1 = not shown */
 } Viz;
 
 struct ComposerEditor {
@@ -72,13 +69,39 @@ struct ComposerEditor {
     GHashTable          *viz;           /* name -> Viz* */
     GtkTextTag          *viz_tag;       /* reserves space under a closing brace */
     guint                viz_layout_id;
-    guint                viz_position_id;
+    guint                playhead_tick;  /* redraws the view while something plays */
     GtkAdjustment       *vadj, *hadj;   /* ref'd: we disconnect from them on destroy */
 };
 
 static void schedule_viz_layout(ComposerEditor *ed);
-static void viz_position(ComposerEditor *ed);
-static gboolean viz_position_idle(gpointer data);
+static void viz_snapshot(ComposerEditor *ed, GtkSnapshot *snapshot);
+
+/* ------------------------------------------------------------------ */
+/*  The text view: a GtkTextView that also draws the //viz panels in    */
+/*  its above-text layer. That layer is in buffer coordinates, so the   */
+/*  panels scroll and re-flow with the text by construction.            */
+/* ------------------------------------------------------------------ */
+
+typedef struct { GtkTextView parent; } ComposerTextView;
+typedef struct { GtkTextViewClass parent_class; } ComposerTextViewClass;
+G_DEFINE_TYPE(ComposerTextView, composer_text_view, GTK_TYPE_TEXT_VIEW)
+
+static void composer_text_view_snapshot_layer(GtkTextView *tv, GtkTextViewLayer layer, GtkSnapshot *snapshot)
+{
+    GtkTextViewClass *parent = GTK_TEXT_VIEW_CLASS(composer_text_view_parent_class);
+    if (parent->snapshot_layer)                    /* NULL in GTK itself */
+        parent->snapshot_layer(tv, layer, snapshot);
+    ComposerEditor *ed = g_object_get_data(G_OBJECT(tv), "composer-editor");
+    if (ed && layer == GTK_TEXT_VIEW_LAYER_ABOVE_TEXT)
+        viz_snapshot(ed, snapshot);
+}
+
+static void composer_text_view_class_init(ComposerTextViewClass *k)
+{
+    GTK_TEXT_VIEW_CLASS(k)->snapshot_layer = composer_text_view_snapshot_layer;
+}
+
+static void composer_text_view_init(ComposerTextView *self) { (void)self; }
 
 /* ------------------------------------------------------------------ */
 /*  Highlighting                                                        */
@@ -641,12 +664,7 @@ static void on_focus_leave(GtkEventControllerFocus *f, gpointer data)
 static void on_scrolled(GtkAdjustment *adj, gpointer data)
 {
     (void)adj;
-    ComposerEditor *ed = data;
-    gtk_widget_queue_draw(ed->gutter);
-    /* the //viz panels are placed in window coordinates (GTK 4.8 doesn't
-     * scroll overlay children), so follow the text ourselves */
-    if (g_hash_table_size(ed->viz))
-        viz_position(ed);
+    gtk_widget_queue_draw(((ComposerEditor *)data)->gutter);
 }
 
 /* ------------------------------------------------------------------ */
@@ -669,6 +687,22 @@ static void on_gutter_click(GtkGestureClick *g, int n, double x, double y, gpoin
     }
 }
 
+/* Hand over a ▶, plain arrow elsewhere in the margin (not the text I-beam). */
+static void on_gutter_motion(GtkEventControllerMotion *m, double x, double y, gpointer data)
+{
+    (void)m;
+    ComposerEditor *ed = data;
+    gboolean over_button = FALSE;
+    if (x <= ed->icon_width + 4) {
+        int bx, by;
+        gtk_text_view_window_to_buffer_coords(ed->view, GTK_TEXT_WINDOW_LEFT, (int)x, (int)y, &bx, &by);
+        GtkTextIter it;
+        gtk_text_view_get_line_at_y(ed->view, &it, by, NULL);
+        over_button = playable_at_line(ed, gtk_text_iter_get_line(&it)) != NULL;
+    }
+    gtk_widget_set_cursor_from_name(ed->gutter, over_button ? "pointer" : "default");
+}
+
 /* ------------------------------------------------------------------ */
 /*  //viz panels                                                        */
 /* ------------------------------------------------------------------ */
@@ -680,10 +714,8 @@ static void viz_free(gpointer p)
     g_free(v);
 }
 
-static void draw_viz(GtkDrawingArea *area, cairo_t *cr, int w, int h, gpointer data)
+static void draw_viz(cairo_t *cr, int w, int h, Viz *v)
 {
-    (void)area;
-    Viz *v = data;
     /* card */
     double r = 6;
     cairo_new_sub_path(cr);
@@ -705,10 +737,8 @@ static void draw_viz(GtkDrawingArea *area, cairo_t *cr, int w, int h, gpointer d
 
     double mid = h / 2.0 + 6, amp = (h - 26) / 2.0;
     if (v->n > 0) {
-        /* centre line */
         cairo_set_source_rgba(cr, 1, 1, 1, 0.12);
         cairo_move_to(cr, 8, mid); cairo_line_to(cr, w - 8, mid); cairo_stroke(cr);
-        /* waveform */
         double x0 = 8, ww = w - 16;
         cairo_pattern_t *grad = cairo_pattern_create_linear(0, mid - amp, 0, mid + amp);
         cairo_pattern_add_color_stop_rgba(grad, 0.0, 0.49, 0.78, 0.60, 0.95);
@@ -722,8 +752,7 @@ static void draw_viz(GtkDrawingArea *area, cairo_t *cr, int w, int h, gpointer d
         cairo_fill(cr);
         cairo_pattern_destroy(grad);
 
-        /* playhead */
-        if (v->play_start) {
+        if (v->play_start) {                                        /* playhead */
             double t = (g_get_monotonic_time() - v->play_start) / 1e6;
             if (t <= v->seconds) {
                 double px = x0 + ww * t / v->seconds;
@@ -751,21 +780,47 @@ static void draw_viz(GtkDrawingArea *area, cairo_t *cr, int w, int h, gpointer d
     g_object_unref(layout);
 }
 
+/* Drawn on every frame from the lines' current positions: nothing to keep
+ * in sync when the text scrolls or changes. */
+static void viz_snapshot(ComposerEditor *ed, GtkSnapshot *snapshot)
+{
+    if (!ed->viz_mode) return;
+    GdkRectangle vis;
+    gtk_text_view_get_visible_rect(ed->view, &vis);
+    int width = MAX(vis.width - 40, 320);
+    int lines = gtk_text_buffer_get_line_count(ed->buffer);
+    GHashTableIter hi;
+    gpointer key, val;
+    g_hash_table_iter_init(&hi, ed->viz);
+    while (g_hash_table_iter_next(&hi, &key, &val)) {
+        Viz *v = val;
+        if (v->end_line < 0 || v->end_line >= lines) continue;
+        GtkTextIter it;
+        int y, h;
+        gtk_text_buffer_get_iter_at_line(ed->buffer, &it, v->end_line);
+        gtk_text_view_get_line_yrange(ed->view, &it, &y, &h);
+        if (h < VIZ_HEIGHT) continue;               /* space not reserved (yet) */
+        int top = y + h - VIZ_HEIGHT - VIZ_GAP / 2, x = vis.x + 14;
+        if (top > vis.y + vis.height || top + VIZ_HEIGHT < vis.y) continue;
+        graphene_rect_t rect = GRAPHENE_RECT_INIT(x, top, width, VIZ_HEIGHT);
+        cairo_t *cr = gtk_snapshot_append_cairo(snapshot, &rect);
+        cairo_translate(cr, x, top);
+        draw_viz(cr, width, VIZ_HEIGHT, v);
+        cairo_destroy(cr);
+    }
+}
+
 static Viz *viz_get(ComposerEditor *ed, const char *name)
 {
     Viz *v = g_hash_table_lookup(ed->viz, name);
     if (v) return v;
     v = g_new0(Viz, 1);
-    v->area = gtk_drawing_area_new();
-    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(v->area), draw_viz, v, NULL);
-    gtk_widget_set_size_request(v->area, 400, VIZ_HEIGHT);
-    gtk_widget_set_can_target(v->area, FALSE);           /* clicks go to the text */
-    gtk_text_view_add_overlay(ed->view, v->area, 0, 0);
-    gtk_widget_set_visible(v->area, FALSE);
+    v->end_line = -1;
     g_hash_table_insert(ed->viz, g_strdup(name), v);
     return v;
 }
 
+/* Which functions have a panel, and the space reserved under them. */
 static gboolean viz_layout(gpointer data)
 {
     ComposerEditor *ed = data;
@@ -793,70 +848,20 @@ static gboolean viz_layout(gpointer data)
             gtk_text_buffer_apply_tag(ed->buffer, ed->viz_tag, &a, &b);
         }
     }
-
-    viz_position(ed);
-    /* line heights settle after GTK re-lays out the text: place again then */
-    if (!ed->viz_position_id)
-        ed->viz_position_id = g_timeout_add(120, viz_position_idle, ed);
+    gtk_widget_queue_draw(GTK_WIDGET(ed->view));
     return G_SOURCE_REMOVE;
 }
 
-/* Place the panels in the space their tag reserves. Runs again whenever the
- * text view re-lays out (line heights are only right after that). */
-static void viz_position(ComposerEditor *ed)
-{
-    GHashTableIter hi;
-    gpointer key, val;
-    GdkRectangle vis;
-    gtk_text_view_get_visible_rect(ed->view, &vis);
-    int width = MAX(vis.width - 40, 320);
-    g_hash_table_iter_init(&hi, ed->viz);
-    while (g_hash_table_iter_next(&hi, &key, &val)) {
-        Viz *v = val;
-        if (v->end_line < 0) { gtk_widget_set_visible(v->area, FALSE); continue; }
-        GtkTextIter it;
-        int y, h;
-        gtk_text_buffer_get_iter_at_line(ed->buffer, &it, v->end_line);
-        gtk_text_view_get_line_yrange(ed->view, &it, &y, &h);
-        int top_buffer = y + h - VIZ_HEIGHT - VIZ_GAP / 2, top, x;
-        gtk_text_view_buffer_to_window_coords(ed->view, GTK_TEXT_WINDOW_TEXT, 14, top_buffer, &x, &top);
-        if (top != v->y || width != v->width || !gtk_widget_get_visible(v->area)) {
-            v->y = top; v->width = width;
-            gtk_widget_set_size_request(v->area, width, VIZ_HEIGHT);
-            gtk_text_view_move_overlay(ed->view, v->area, x, top);
-            gtk_widget_set_visible(v->area, TRUE);
-        }
-    }
-}
-
-static gboolean viz_position_idle(gpointer data)
-{
-    ComposerEditor *ed = data;
-    ed->viz_position_id = 0;
-    viz_position(ed);
-    gtk_widget_queue_draw(ed->gutter);
-    return G_SOURCE_REMOVE;
-}
-
-/* Emitted from inside size allocation: only schedule the move for after it. */
 static void on_layout_changed(GtkAdjustment *adj, gpointer data)
 {
     (void)adj;
-    ComposerEditor *ed = data;
-    if (!ed->viz_position_id)
-        ed->viz_position_id = g_idle_add(viz_position_idle, ed);
+    gtk_widget_queue_draw(((ComposerEditor *)data)->gutter);
 }
 
 static void schedule_viz_layout(ComposerEditor *ed)
 {
     if (!ed->viz_layout_id)
         ed->viz_layout_id = g_idle_add_full(G_PRIORITY_LOW, viz_layout, ed, NULL);
-}
-
-static void on_view_resize(GObject *o, GParamSpec *ps, gpointer data)
-{
-    (void)o; (void)ps;
-    schedule_viz_layout(data);
 }
 
 /* ------------------------------------------------------------------ */
@@ -870,8 +875,6 @@ static void editor_free(gpointer data)
         g_source_remove(ed->update_id);
     if (ed->viz_layout_id)
         g_source_remove(ed->viz_layout_id);
-    if (ed->viz_position_id)
-        g_source_remove(ed->viz_position_id);
     g_hash_table_unref(ed->viz);
     g_free(ed->busy_fn);
     g_free(ed->playing_fn);
@@ -901,17 +904,11 @@ static void on_destroy(GtkWidget *w, gpointer data)
         g_source_remove(ed->viz_layout_id);
         ed->viz_layout_id = 0;
     }
-    if (ed->viz_position_id) {
-        g_source_remove(ed->viz_position_id);
-        ed->viz_position_id = 0;
+    if (ed->playhead_tick) {
+        gtk_widget_remove_tick_callback(GTK_WIDGET(ed->view), ed->playhead_tick);
+        ed->playhead_tick = 0;
     }
-    GHashTableIter hi;
-    gpointer key, val;
-    g_hash_table_iter_init(&hi, ed->viz);
-    while (g_hash_table_iter_next(&hi, &key, &val)) {
-        Viz *v = val;
-        if (v->tick_id) { gtk_widget_remove_tick_callback(v->area, v->tick_id); v->tick_id = 0; }
-    }
+    g_object_set_data(G_OBJECT(ed->view), "composer-editor", NULL);
 }
 
 ComposerEditor *composer_editor_new(const Language *lang)
@@ -920,7 +917,8 @@ ComposerEditor *composer_editor_new(const Language *lang)
     ed->lang = lang;
 
     ed->buffer = gtk_text_buffer_new(NULL);
-    ed->view   = GTK_TEXT_VIEW(gtk_text_view_new_with_buffer(ed->buffer));
+    ed->view   = GTK_TEXT_VIEW(g_object_new(composer_text_view_get_type(), "buffer", ed->buffer, NULL));
+    g_object_set_data(G_OBJECT(ed->view), "composer-editor", ed);
     /* the view owns the buffer; keep our own reference so it outlives the
      * view during teardown (we disconnect from it in on_destroy) */
 
@@ -942,11 +940,15 @@ ComposerEditor *composer_editor_new(const Language *lang)
     GtkGesture *gclick = gtk_gesture_click_new();
     g_signal_connect(gclick, "pressed", G_CALLBACK(on_gutter_click), ed);
     gtk_widget_add_controller(ed->gutter, GTK_EVENT_CONTROLLER(gclick));
+    GtkEventController *gmotion = gtk_event_controller_motion_new();
+    g_signal_connect(gmotion, "enter", G_CALLBACK(on_gutter_motion), ed);
+    g_signal_connect(gmotion, "motion", G_CALLBACK(on_gutter_motion), ed);
+    gtk_widget_add_controller(ed->gutter, gmotion);
+    gtk_widget_set_cursor_from_name(ed->gutter, "default");
 
     ed->viz = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, viz_free);
     ed->viz_tag = gtk_text_buffer_create_tag(ed->buffer, "viz-space",
                                              "pixels-below-lines", VIZ_HEIGHT + VIZ_GAP, NULL);
-    g_signal_connect(ed->view, "notify::width", G_CALLBACK(on_view_resize), ed);
 
     ed->scroller = gtk_scrolled_window_new();
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(ed->scroller), GTK_WIDGET(ed->view));
@@ -1055,7 +1057,7 @@ void composer_editor_set_viz_state(ComposerEditor *ed, const char *function, con
     Viz *v = viz_get(ed, function);
     g_free(v->state);
     v->state = g_strdup(state);
-    gtk_widget_queue_draw(v->area);
+    gtk_widget_queue_draw(GTK_WIDGET(ed->view));
 }
 
 void composer_editor_set_viz_audio(ComposerEditor *ed, const char *function,
@@ -1086,16 +1088,17 @@ void composer_editor_set_viz_audio(ComposerEditor *ed, const char *function,
         for (int c = 0; c < v->n; c++) { v->lo[c] /= m; v->hi[c] /= m; }
     g_free(v->state);
     v->state = NULL;
-    gtk_widget_queue_draw(v->area);
+    gtk_widget_queue_draw(GTK_WIDGET(ed->view));
 }
 
-static gboolean viz_tick(GtkWidget *w, GdkFrameClock *clock, gpointer data)
+static gboolean playhead_tick(GtkWidget *w, GdkFrameClock *clock, gpointer data)
 {
     (void)clock;
-    Viz *v = data;
+    ComposerEditor *ed = data;
     gtk_widget_queue_draw(w);
-    if (!v->play_start || (g_get_monotonic_time() - v->play_start) / 1e6 > v->seconds) {
-        v->tick_id = 0;
+    Viz *v = ed->playing_fn ? g_hash_table_lookup(ed->viz, ed->playing_fn) : NULL;
+    if (!v || !v->play_start || (g_get_monotonic_time() - v->play_start) / 1e6 > v->seconds) {
+        ed->playhead_tick = 0;
         return G_SOURCE_REMOVE;
     }
     return G_SOURCE_CONTINUE;
@@ -1103,10 +1106,9 @@ static gboolean viz_tick(GtkWidget *w, GdkFrameClock *clock, gpointer data)
 
 void composer_editor_set_playing(ComposerEditor *ed, const char *function)
 {
-    /* stop the previous playhead */
-    if (ed->playing_fn) {
+    if (ed->playing_fn) {                          /* stop the previous playhead */
         Viz *old = g_hash_table_lookup(ed->viz, ed->playing_fn);
-        if (old) { old->play_start = 0; gtk_widget_queue_draw(old->area); }
+        if (old) old->play_start = 0;
     }
     g_free(ed->playing_fn);
     ed->playing_fn = g_strdup(function);
@@ -1114,9 +1116,11 @@ void composer_editor_set_playing(ComposerEditor *ed, const char *function)
         Viz *v = g_hash_table_lookup(ed->viz, function);
         if (v && v->n) {
             v->play_start = g_get_monotonic_time();
-            if (!v->tick_id) v->tick_id = gtk_widget_add_tick_callback(v->area, viz_tick, v, NULL);
+            if (!ed->playhead_tick)
+                ed->playhead_tick = gtk_widget_add_tick_callback(GTK_WIDGET(ed->view), playhead_tick, ed, NULL);
         }
     }
+    gtk_widget_queue_draw(GTK_WIDGET(ed->view));
     gtk_widget_queue_draw(ed->gutter);
 }
 
