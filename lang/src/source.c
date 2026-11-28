@@ -324,6 +324,19 @@ int src_scan_functions(const char *text, src_function *out, int max)
         else if (!strcmp(f.ret_type, "void"))  f.ret = RET_VOID;
         else                                   f.ret = RET_OTHER;
 
+        /* parameters: the text as written, whitespace collapsed */
+        {
+            const char *from = t[open].s + 1, *to = t[close].s;
+            size_t o = 0;
+            bool space = false;
+            for (const char *q = from; q < to && o + 1 < sizeof f.param_text; q++) {
+                if (isspace((unsigned char)*q)) { space = o > 0; continue; }
+                if (space && o + 2 < sizeof f.param_text) f.param_text[o++] = ' ';
+                space = false;
+                f.param_text[o++] = *q;
+            }
+            f.param_text[o] = '\0';
+        }
         /* parameters */
         bool all_known = true;
         int a = open + 1;

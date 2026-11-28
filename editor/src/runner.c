@@ -23,6 +23,7 @@ struct Runner {
 
     GSubprocess  *player;
     guint         player_gen;
+    char         *cwd;
 };
 
 typedef struct { RunnerBuildDone done; gpointer data; } Waiter;
@@ -55,7 +56,7 @@ static void runner_clear(gpointer data)
         g_dir_close(d);
         g_rmdir(r->dir);
     }
-    g_free(r->dir); g_free(r->exe);
+    g_free(r->dir); g_free(r->exe); g_free(r->cwd);
     g_free(r->built_hash); g_free(r->built_log);
     g_free(r->pending_text); g_free(r->pending_label);
     g_array_unref(r->pending_waiters);
@@ -74,6 +75,12 @@ void runner_free(Runner *r)
 }
 
 const char *runner_dir(Runner *r) { return r->dir; }
+
+void runner_set_cwd(Runner *r, const char *dir)
+{
+    g_free(r->cwd);
+    r->cwd = g_strdup(dir);
+}
 
 /* ------------------------------------------------------------------ */
 /*  Build (in a worker thread)                                         */
@@ -226,8 +233,10 @@ static void render_finished(GObject *src, GAsyncResult *res, gpointer user)
 void runner_render(Runner *r, const char *function, const char *path, RunnerRenderDone done, gpointer data)
 {
     GError *err = NULL;
-    GSubprocess *p = g_subprocess_new(G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_MERGE, &err,
-                                      r->exe, "call", function, path, NULL);
+    GSubprocessLauncher *l = g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_MERGE);
+    if (r->cwd) g_subprocess_launcher_set_cwd(l, r->cwd);
+    GSubprocess *p = g_subprocess_launcher_spawn(l, &err, r->exe, "call", function, path, NULL);
+    g_object_unref(l);
     if (!p) {
         done(FALSE, err->message, path, data);
         g_error_free(err);
