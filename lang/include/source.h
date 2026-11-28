@@ -30,6 +30,7 @@ typedef struct {
     src_ret   ret;
     int       n_params;
     src_param params[SRC_MAX_PARAMS];
+    char      param_text[256]; /* the parameter list as written: "note n, chord c" */
     bool      playable;      /* no params, or only notes/chords (played with C4 / C major) */
     bool      viz;           /* "//viz" after its closing brace */
     int       header_line;   /* 0-based line of the name */

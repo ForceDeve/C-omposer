@@ -18,6 +18,8 @@ typedef void (*RunnerPlayDone)(gpointer data);
 Runner     *runner_new(void);
 void        runner_free(Runner *r);          /* pending callbacks are dropped */
 const char *runner_dir(Runner *r);           /* scratch directory for renders */
+/* Songs run in this folder (the project), so load_sample("samples/x.wav") works. */
+void        runner_set_cwd(Runner *r, const char *dir);
 
 void runner_build(Runner *r, const char *text, const char *label, RunnerBuildDone done, gpointer data);
 

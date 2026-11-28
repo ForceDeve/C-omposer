@@ -17,6 +17,8 @@
 #include <string.h>
 
 #include "source.h"
+#include "sighelp.h"
+#include "visuals.h"
 
 #define VIZ_HEIGHT  92        /* inline visualiser, pixels */
 #define VIZ_GAP     10
@@ -71,6 +73,8 @@ struct ComposerEditor {
     guint                viz_layout_id;
     guint                playhead_tick;  /* redraws the view while something plays */
     GtkAdjustment       *vadj, *hadj;   /* ref'd: we disconnect from them on destroy */
+    SigHelp             *sighelp;       /* parameter hints inside a call's () */
+    Visuals             *visuals;       /* picture / visualizer behind the code */
 };
 
 static void schedule_viz_layout(ComposerEditor *ed);
@@ -94,11 +98,26 @@ static void composer_text_view_snapshot_layer(GtkTextView *tv, GtkTextViewLayer 
     ComposerEditor *ed = g_object_get_data(G_OBJECT(tv), "composer-editor");
     if (ed && layer == GTK_TEXT_VIEW_LAYER_ABOVE_TEXT)
         viz_snapshot(ed, snapshot);
+    if (ed && ed->visuals && layer == GTK_TEXT_VIEW_LAYER_BELOW_TEXT) {
+        GdkRectangle r;
+        gtk_text_view_get_visible_rect(tv, &r);
+        graphene_rect_t vis = GRAPHENE_RECT_INIT(r.x, r.y, r.width, r.height);
+        visuals_snapshot(ed->visuals, snapshot, &vis);
+    }
+}
+
+/* Popovers parented to a widget have to be placed in its size_allocate. */
+static void composer_text_view_size_allocate(GtkWidget *w, int width, int height, int baseline)
+{
+    GTK_WIDGET_CLASS(composer_text_view_parent_class)->size_allocate(w, width, height, baseline);
+    ComposerEditor *ed = g_object_get_data(G_OBJECT(w), "composer-editor");
+    if (ed && ed->sighelp) sighelp_present(ed->sighelp);
 }
 
 static void composer_text_view_class_init(ComposerTextViewClass *k)
 {
     GTK_TEXT_VIEW_CLASS(k)->snapshot_layer = composer_text_view_snapshot_layer;
+    GTK_WIDGET_CLASS(k)->size_allocate = composer_text_view_size_allocate;
 }
 
 static void composer_text_view_init(ComposerTextView *self) { (void)self; }
@@ -328,6 +347,13 @@ static gboolean update_idle(gpointer data)
     if (ed->want_completion || completion_is_visible(ed->completion))
         completion_refresh(ed->completion, ed->lang, ed->symbols, ed->force_completion);
     ed->want_completion = ed->force_completion = FALSE;
+
+    if (ed->sighelp && gtk_widget_has_focus(GTK_WIDGET(ed->view))) {
+        GtkTextIter c;
+        gtk_text_buffer_get_iter_at_mark(ed->buffer, &c, gtk_text_buffer_get_insert(ed->buffer));
+        sighelp_update(ed->sighelp, ed->lang, ed->text, ed->tokens, gtk_text_iter_get_offset(&c),
+                       ed->funcs, ed->n_funcs);
+    }
 
     if (ed->cursor_cb) {
         GtkTextIter c;
@@ -625,6 +651,10 @@ static gboolean on_key_pressed(GtkEventControllerKey *ctl, guint keyval, guint k
 
     if (completion_handle_key(ed->completion, keyval, state))
         return TRUE;
+    if (keyval == GDK_KEY_Escape && ed->sighelp && sighelp_visible(ed->sighelp)) {
+        sighelp_hide(ed->sighelp);
+        return TRUE;
+    }
 
     if ((state & GDK_CONTROL_MASK) && keyval == GDK_KEY_space) {
         ed->want_completion = ed->force_completion = TRUE;
@@ -658,13 +688,24 @@ static void on_click(GtkGestureClick *g, int n, double x, double y, gpointer dat
 static void on_focus_leave(GtkEventControllerFocus *f, gpointer data)
 {
     (void)f;
-    completion_hide(((ComposerEditor *)data)->completion);
+    ComposerEditor *ed = data;
+    completion_hide(ed->completion);
+    if (ed->sighelp) sighelp_hide(ed->sighelp);
+}
+
+static void on_theme_changed(gpointer data)
+{
+    ComposerEditor *ed = data;
+    gtk_widget_queue_draw(ed->gutter);
+    gtk_widget_queue_draw(GTK_WIDGET(ed->view));
 }
 
 static void on_scrolled(GtkAdjustment *adj, gpointer data)
 {
     (void)adj;
-    gtk_widget_queue_draw(((ComposerEditor *)data)->gutter);
+    ComposerEditor *ed = data;
+    gtk_widget_queue_draw(ed->gutter);
+    if (ed->sighelp) sighelp_reposition(ed->sighelp);
 }
 
 /* ------------------------------------------------------------------ */
@@ -716,6 +757,9 @@ static void viz_free(gpointer p)
 
 static void draw_viz(cairo_t *cr, int w, int h, Viz *v)
 {
+    GdkRGBA fg;                                   /* tints follow the theme's text colour */
+    if (!gdk_rgba_parse(&fg, theme_get()->foreground)) gdk_rgba_parse(&fg, "#ffffff");
+#define FG(a) cairo_set_source_rgba(cr, fg.red, fg.green, fg.blue, (a))
     /* card */
     double r = 6;
     cairo_new_sub_path(cr);
@@ -724,9 +768,9 @@ static void draw_viz(cairo_t *cr, int w, int h, Viz *v)
     cairo_arc(cr, r + 0.5, h - r - 0.5, r, G_PI / 2, G_PI);
     cairo_arc(cr, r + 0.5, r + 0.5, r, G_PI, 3 * G_PI / 2);
     cairo_close_path(cr);
-    cairo_set_source_rgba(cr, 1, 1, 1, 0.045);
+    FG(0.05);
     cairo_fill_preserve(cr);
-    cairo_set_source_rgba(cr, 1, 1, 1, 0.10);
+    FG(0.14);
     cairo_set_line_width(cr, 1);
     cairo_stroke(cr);
 
@@ -737,7 +781,7 @@ static void draw_viz(cairo_t *cr, int w, int h, Viz *v)
 
     double mid = h / 2.0 + 6, amp = (h - 26) / 2.0;
     if (v->n > 0) {
-        cairo_set_source_rgba(cr, 1, 1, 1, 0.12);
+        FG(0.14);
         cairo_move_to(cr, 8, mid); cairo_line_to(cr, w - 8, mid); cairo_stroke(cr);
         double x0 = 8, ww = w - 16;
         cairo_pattern_t *grad = cairo_pattern_create_linear(0, mid - amp, 0, mid + amp);
@@ -765,7 +809,7 @@ static void draw_viz(cairo_t *cr, int w, int h, Viz *v)
         g_snprintf(info, sizeof info, "%.2f s   peak %.1f dBFS", v->seconds,
                    v->peak > 0 ? 20 * log10(v->peak) : -120.0);
         pango_layout_set_text(layout, info, -1);
-        cairo_set_source_rgba(cr, 1, 1, 1, 0.45);
+        FG(0.6);
         cairo_move_to(cr, 10, 3);
         pango_cairo_show_layout(cr, layout);
     }
@@ -773,11 +817,12 @@ static void draw_viz(cairo_t *cr, int w, int h, Viz *v)
         pango_layout_set_text(layout, v->state ? v->state : "waiting for a render…", -1);
         int tw, th;
         pango_layout_get_pixel_size(layout, &tw, &th);
-        cairo_set_source_rgba(cr, 1, 1, 1, 0.55);
+        FG(0.65);
         cairo_move_to(cr, v->n ? w - tw - 10 : (w - tw) / 2.0, v->n ? 3 : (h - th) / 2.0);
         pango_cairo_show_layout(cr, layout);
     }
     g_object_unref(layout);
+#undef FG
 }
 
 /* Drawn on every frame from the lines' current positions: nothing to keep
@@ -908,6 +953,9 @@ static void on_destroy(GtkWidget *w, gpointer data)
         gtk_widget_remove_tick_callback(GTK_WIDGET(ed->view), ed->playhead_tick);
         ed->playhead_tick = 0;
     }
+    theme_remove_listener(on_theme_changed, ed);
+    if (ed->sighelp) { sighelp_free(ed->sighelp); ed->sighelp = NULL; }
+    if (ed->visuals) { visuals_free(ed->visuals); ed->visuals = NULL; }
     g_object_set_data(G_OBJECT(ed->view), "composer-editor", NULL);
 }
 
@@ -962,6 +1010,9 @@ ComposerEditor *composer_editor_new(const Language *lang)
     g_signal_connect(ed->hadj, "value-changed", G_CALLBACK(on_scrolled), ed);
 
     ed->completion = completion_new(ed->view);
+    ed->sighelp = sighelp_new(ed->view);
+    ed->visuals = visuals_new(GTK_WIDGET(ed->view));
+    theme_add_listener(on_theme_changed, ed);
 
     g_signal_connect(ed->buffer, "changed", G_CALLBACK(on_changed), ed);
     g_signal_connect_after(ed->buffer, "insert-text", G_CALLBACK(on_insert_text_after), ed);
@@ -1125,3 +1176,5 @@ void composer_editor_set_playing(ComposerEditor *ed, const char *function)
 }
 
 const char *composer_editor_playing(ComposerEditor *ed) { return ed->playing_fn; }
+
+Visuals *composer_editor_visuals(ComposerEditor *ed) { return ed->visuals; }

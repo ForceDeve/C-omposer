@@ -8,6 +8,7 @@
 #include <gtk/gtk.h>
 #include "language.h"
 #include "source.h"
+#include "visuals.h"
 
 typedef struct ComposerEditor ComposerEditor;
 
@@ -42,3 +43,6 @@ const char *composer_editor_playing(ComposerEditor *editor);   /* NULL if nothin
 void composer_editor_set_viz_state(ComposerEditor *editor, const char *function, const char *state);
 void composer_editor_set_viz_audio(ComposerEditor *editor, const char *function,
                                    const float *l, const float *r, guint frames, guint rate);
+
+/* What's drawn behind the code (Interpreter mode). */
+Visuals *composer_editor_visuals(ComposerEditor *editor);

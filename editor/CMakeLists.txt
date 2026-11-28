@@ -25,7 +25,13 @@ add_executable(C_omposer
         src/language.c
         src/theme.c
         src/runner.c
+        src/settings.c
+        src/sighelp.c
+        src/sidebar.c
+        src/visuals.c
+        src/prefs.c
         ${TEMPLATES_C}
 )
 target_link_libraries(C_omposer PRIVATE PkgConfig::GTK4 lang_music)
 target_compile_options(C_omposer PRIVATE -Wall -Wextra)
+target_compile_definitions(C_omposer PRIVATE COMPOSER_THEME_DIR="${CMAKE_CURRENT_SOURCE_DIR}/themes")

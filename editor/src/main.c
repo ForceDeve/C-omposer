@@ -8,8 +8,11 @@
 #include "editor.h"
 #include "language.h"
 #include "theme.h"
+#include "settings.h"
 
 #include "runner.h"
+#include "sidebar.h"
+#include "prefs.h"
 #include "audio.h"
 
 typedef enum { MODE_INTERPRETER, MODE_COMPILER } RunMode;
@@ -34,7 +37,12 @@ typedef struct {
     guint           live_timer;
     guint           live_gen;        /* newer live updates make older renders stale */
     GPtrArray      *viz_queue;       /* function names still to render */
+
+    Sidebar        *sidebar;
+    GtkWidget      *sidebar_toggle;
 } ComposerWindow;
+
+static GList *all_windows;          /* ComposerWindow*: settings apply to every window */
 
 /* Templates, generated at build time from the .cmp files in editor/templates. */
 extern const char TEMPLATE_basic[];
@@ -409,13 +417,16 @@ static const src_function *find_function(ComposerWindow *w, const char *name)
 }
 
 /* Load a render and show it in the function's //viz panel (if it has one). */
-static double show_render(ComposerWindow *w, const char *function, const char *path)
+static double show_render(ComposerWindow *w, const char *function, const char *path, gboolean for_visualizer)
 {
     sound s = sound_load(path);
     double seconds = s.frames ? (double)s.frames / audio.rate : 0;
-    const src_function *f = find_function(w, function);
+    const src_function *f = function ? find_function(w, function) : NULL;
     if (s.frames && f && f->viz)
         composer_editor_set_viz_audio(w->editor, function, s.l, s.r, s.frames, audio.rate);
+    Visuals *vis = composer_editor_visuals(w->editor);
+    if (for_visualizer && s.frames && visuals_wants_audio(vis))
+        visuals_set_audio(vis, s.l, s.r, s.frames, audio.rate);
     sound_free(&s);
     return seconds;
 }
@@ -434,6 +445,7 @@ static void playback_ended(gpointer data)
 {
     ComposerWindow *w = data;
     composer_editor_set_playing(w->editor, NULL);
+    visuals_play_stopped(composer_editor_visuals(w->editor));
     set_status(w, NULL);
 }
 
@@ -444,10 +456,11 @@ static void play_rendered(gboolean ok, const char *out, const char *path, gpoint
     output_append(w, out);
     composer_editor_set_busy(w->editor, NULL);
     if (ok) {
-        show_render(w, j->function, path);
+        show_render(w, j->function, path, TRUE);
         char *err = NULL;
         if (runner_play(w->runner, path, playback_ended, w, &err)) {
             composer_editor_set_playing(w->editor, j->function);
+            visuals_play_started(composer_editor_visuals(w->editor));
             char *msg = g_strdup_printf("Playing %s()", j->function);
             set_status(w, msg);
             g_free(msg);
@@ -500,6 +513,7 @@ static void on_play_clicked(ComposerEditor *ed, const char *function, gpointer d
     if (playing && !strcmp(playing, function)) {        /* ■ : stop */
         runner_stop(w->runner);
         composer_editor_set_playing(w->editor, NULL);
+        visuals_play_stopped(composer_editor_visuals(w->editor));
         set_status(w, "Stopped");
         return;
     }
@@ -515,6 +529,7 @@ static void act_stop(GSimpleAction *a, GVariant *p, gpointer data)
     ComposerWindow *w = data;
     runner_stop(w->runner);
     composer_editor_set_playing(w->editor, NULL);
+    visuals_play_stopped(composer_editor_visuals(w->editor));
     set_status(w, "Stopped");
 }
 
@@ -639,7 +654,7 @@ static void viz_rendered(gboolean ok, const char *out, const char *path, gpointe
     ComposerWindow *w = j->w;
     if (j->gen == w->live_gen) {
         if (ok) {
-            show_render(w, j->function, path);
+            show_render(w, j->function, path, FALSE);
         } else {
             char *first = g_strdup(out && *out ? out : "render failed");
             char *nl = strchr(first, '\n');
@@ -732,6 +747,7 @@ static void set_mode(ComposerWindow *w, RunMode mode)
 {
     w->mode = mode;
     composer_editor_set_viz_mode(w->editor, mode == MODE_INTERPRETER);
+    visuals_set_active(composer_editor_visuals(w->editor), mode == MODE_INTERPRETER);
     gtk_button_set_label(GTK_BUTTON(w->run_button), mode == MODE_INTERPRETER ? "▶  Run" : "⤓  Build");
     gtk_widget_set_tooltip_text(w->run_button, mode == MODE_INTERPRETER
         ? "Run main() and play it (F5)"
@@ -747,12 +763,185 @@ static void on_mode_toggled(GtkToggleButton *b, gpointer data)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Preferences, background visuals                                     */
+/* ------------------------------------------------------------------ */
+
+static void apply_visual_settings(ComposerWindow *w)
+{
+    Settings *s = settings_get();
+    Visuals *v = composer_editor_visuals(w->editor);
+    visuals_configure(v, s->bg_image, s->bg_dim, s->visualizer, s->vis_intensity);
+    visuals_set_active(v, w->mode == MODE_INTERPRETER);
+}
+
+static void prefs_changed(gpointer data)
+{
+    (void)data;
+    for (GList *l = all_windows; l; l = l->next) apply_visual_settings(l->data);
+}
+
+static void act_prefs(GSimpleAction *a, GVariant *p, gpointer data)
+{
+    (void)a; (void)p;
+    ComposerWindow *w = data;
+    prefs_show(GTK_WINDOW(w->window), prefs_changed, NULL);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Projects sidebar                                                    */
+/* ------------------------------------------------------------------ */
+
+static void side_open(GFile *file, gpointer data) { after_open(data, file); }
+
+static void side_play(GFile *file, gpointer data)
+{
+    ComposerWindow *w = data;
+    char *path = g_file_get_path(file);
+    if (!path) return;
+    char *err = NULL;
+    composer_editor_set_playing(w->editor, NULL);
+    show_render(w, NULL, path, TRUE);
+    if (runner_play(w->runner, path, playback_ended, w, &err)) {
+        visuals_play_started(composer_editor_visuals(w->editor));
+        char *base = g_path_get_basename(path);
+        char *msg = g_strdup_printf("Previewing %s", base);
+        set_status(w, msg);
+        g_free(msg); g_free(base);
+    } else {
+        set_status(w, err);
+        g_free(err);
+    }
+    g_free(path);
+}
+
+static void side_insert(const char *text, gpointer data)
+{
+    ComposerWindow *w = data;
+    gtk_text_buffer_insert_at_cursor(composer_editor_buffer(w->editor), text, -1);
+    gtk_widget_grab_focus(GTK_WIDGET(composer_editor_view(w->editor)));
+}
+
+static void side_project_changed(const char *dir, gpointer data)
+{
+    ComposerWindow *w = data;
+    runner_set_cwd(w->runner, dir);           /* load_sample("samples/x.wav") works */
+    Settings *s = settings_get();
+    if (g_strcmp0(s->project_dir, dir)) {
+        g_free(s->project_dir);
+        s->project_dir = g_strdup(dir);
+        settings_save();
+    }
+}
+
+/* A new project: samples/, snippets/ and a main.cmp to start from. */
+static void create_project(ComposerWindow *w, const char *dir)
+{
+    const char *sub[] = { "samples", "snippets" };
+    for (size_t i = 0; i < G_N_ELEMENTS(sub); i++) {
+        char *p = g_build_filename(dir, sub[i], NULL);
+        g_mkdir_with_parents(p, 0755);
+        g_free(p);
+    }
+    char *main_file = g_build_filename(dir, "main.cmp", NULL);
+    if (!g_file_test(main_file, G_FILE_TEST_EXISTS))
+        g_file_set_contents(main_file, templates[0].text, -1, NULL);
+    char *snippet = g_build_filename(dir, "snippets", "four_on_the_floor.cmp", NULL);
+    if (!g_file_test(snippet, G_FILE_TEST_EXISTS))
+        g_file_set_contents(snippet,
+            "sound four_on_the_floor(void) {\n"
+            "    part p = pattern(\"x...x...x...x...\", KICK);\n"
+            "    part_pattern(&p, \"....x.......x...\", CLAP, 0.25b, 100);\n"
+            "    part_pattern(&p, \"..x...x...x...x.\", HAT, 0.25b, 90);\n"
+            "    return drum_machine(KIT_808, p);\n"
+            "}\n", -1, NULL);
+    sidebar_set_project(w->sidebar, dir);
+    GFile *f = g_file_new_for_path(main_file);
+    after_open(w, f);
+    g_object_unref(f);
+    g_free(main_file); g_free(snippet);
+}
+
+typedef struct { ComposerWindow *w; gboolean create; } FolderJob;
+
+static void folder_chosen(FolderJob *j, GFile *folder)
+{
+    char *dir = folder ? g_file_get_path(folder) : NULL;
+    if (dir) {
+        if (j->create) create_project(j->w, dir);
+        else           sidebar_set_project(j->w->sidebar, dir);
+        if (!gtk_widget_get_visible(sidebar_widget(j->w->sidebar)))
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(j->w->sidebar_toggle), TRUE);
+    }
+    g_free(dir);
+    g_free(j);
+}
+
+#if GTK_CHECK_VERSION(4, 10, 0)
+static void folder_done(GObject *src, GAsyncResult *res, gpointer data)
+{
+    GFile *f = gtk_file_dialog_select_folder_finish(GTK_FILE_DIALOG(src), res, NULL);
+    folder_chosen(data, f);
+    if (f) g_object_unref(f);
+}
+static void choose_folder(ComposerWindow *w, gboolean create)
+{
+    FolderJob *j = g_new0(FolderJob, 1);
+    *j = (FolderJob){ w, create };
+    GtkFileDialog *d = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(d, create ? "New project: choose or create an empty folder" : "Open a project folder");
+    gtk_file_dialog_select_folder(d, GTK_WINDOW(w->window), NULL, folder_done, j);
+    g_object_unref(d);
+}
+#else
+static void folder_response(GtkNativeDialog *d, int response, gpointer data)
+{
+    GFile *f = response == GTK_RESPONSE_ACCEPT ? gtk_file_chooser_get_file(GTK_FILE_CHOOSER(d)) : NULL;
+    folder_chosen(data, f);
+    if (f) g_object_unref(f);
+    g_object_unref(d);
+}
+static void choose_folder(ComposerWindow *w, gboolean create)
+{
+    FolderJob *j = g_new0(FolderJob, 1);
+    *j = (FolderJob){ w, create };
+    GtkFileChooserNative *d = gtk_file_chooser_native_new(
+        create ? "New project: choose or create an empty folder" : "Open a project folder",
+        GTK_WINDOW(w->window), GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER, create ? "_Create here" : "_Open", "_Cancel");
+    g_signal_connect(d, "response", G_CALLBACK(folder_response), j);
+    gtk_native_dialog_show(GTK_NATIVE_DIALOG(d));
+}
+#endif
+
+static void side_new_project(gpointer data)  { choose_folder(data, TRUE); }
+static void side_open_project(gpointer data) { choose_folder(data, FALSE); }
+static void act_new_project(GSimpleAction *a, GVariant *p, gpointer data)  { (void)a; (void)p; choose_folder(data, TRUE); }
+static void act_open_project(GSimpleAction *a, GVariant *p, gpointer data) { (void)a; (void)p; choose_folder(data, FALSE); }
+
+static void on_sidebar_toggled(GtkToggleButton *b, gpointer data)
+{
+    ComposerWindow *w = data;
+    gboolean on = gtk_toggle_button_get_active(b);
+    gtk_widget_set_visible(sidebar_widget(w->sidebar), on);
+    Settings *s = settings_get();
+    if (s->sidebar != on) { s->sidebar = on; settings_save(); }
+}
+
+static void act_toggle_sidebar(GSimpleAction *a, GVariant *p, gpointer data)
+{
+    (void)a; (void)p;
+    ComposerWindow *w = data;
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(w->sidebar_toggle),
+                                 !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w->sidebar_toggle)));
+}
+
+/* ------------------------------------------------------------------ */
 /*  Window                                                              */
 /* ------------------------------------------------------------------ */
 
 static void composer_window_free(gpointer data)
 {
     ComposerWindow *w = data;
+    all_windows = g_list_remove(all_windows, w);
     if (w->live_timer) g_source_remove(w->live_timer);
     runner_free(w->runner);
     g_ptr_array_unref(w->viz_queue);
@@ -777,7 +966,12 @@ static ComposerWindow *composer_window_new(GtkApplication *app, GFile *file)
         { .name = "run",      .activate = act_run      },
         { .name = "stop",     .activate = act_stop     },
         { .name = "clear-output", .activate = act_clear_output },
+        { .name = "preferences",  .activate = act_prefs },
+        { .name = "new-project",  .activate = act_new_project },
+        { .name = "open-project", .activate = act_open_project },
+        { .name = "toggle-sidebar", .activate = act_toggle_sidebar },
     };
+    all_windows = g_list_prepend(all_windows, w);
     w->runner = runner_new();
     w->viz_queue = g_ptr_array_new_with_free_func(g_free);
     g_action_map_add_action_entries(G_ACTION_MAP(w->window), actions, G_N_ELEMENTS(actions), w);
@@ -787,6 +981,11 @@ static ComposerWindow *composer_window_new(GtkApplication *app, GFile *file)
     w->title = gtk_label_new(NULL);
     gtk_widget_add_css_class(w->title, "title");
     gtk_header_bar_set_title_widget(GTK_HEADER_BAR(header), w->title);
+
+    w->sidebar_toggle = gtk_toggle_button_new();
+    gtk_button_set_icon_name(GTK_BUTTON(w->sidebar_toggle), "sidebar-show-symbolic");
+    gtk_widget_set_tooltip_text(w->sidebar_toggle, "Project sidebar (F9)");
+    gtk_header_bar_pack_start(GTK_HEADER_BAR(header), w->sidebar_toggle);
 
     GtkWidget *open = gtk_button_new_with_label("Open");
     gtk_actionable_set_action_name(GTK_ACTIONABLE(open), "win.open");
@@ -831,6 +1030,15 @@ static ComposerWindow *composer_window_new(GtkApplication *app, GFile *file)
     g_menu_append(menu, "New window", "win.new");
     g_menu_append(menu, "Save as…", "win.save-as");
     g_menu_append(menu, "Clear output", "win.clear-output");
+    GMenu *proj = g_menu_new();
+    g_menu_append(proj, "New project…", "win.new-project");
+    g_menu_append(proj, "Open project folder…", "win.open-project");
+    g_menu_append_section(menu, NULL, G_MENU_MODEL(proj));
+    g_object_unref(proj);
+    GMenu *prefs = g_menu_new();
+    g_menu_append(prefs, "Preferences…", "win.preferences");
+    g_menu_append_section(menu, NULL, G_MENU_MODEL(prefs));
+    g_object_unref(prefs);
     GtkWidget *menu_btn = gtk_menu_button_new();
     gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(menu_btn), "open-menu-symbolic");
     gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(menu_btn), G_MENU_MODEL(menu));
@@ -885,8 +1093,19 @@ static ComposerWindow *composer_window_new(GtkApplication *app, GFile *file)
     gtk_paned_set_position(GTK_PANED(paned), 540);
     gtk_widget_set_vexpand(paned, TRUE);
 
+    /* projects sidebar | (editor / output) */
+    SidebarCallbacks cb = { side_open, side_play, side_insert, side_project_changed,
+                            side_new_project, side_open_project, w };
+    w->sidebar = sidebar_new(&cb);
+    GtkWidget *hpaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_paned_set_start_child(GTK_PANED(hpaned), sidebar_widget(w->sidebar));
+    gtk_paned_set_end_child(GTK_PANED(hpaned), paned);
+    gtk_paned_set_resize_start_child(GTK_PANED(hpaned), FALSE);
+    gtk_paned_set_shrink_start_child(GTK_PANED(hpaned), FALSE);
+    gtk_paned_set_position(GTK_PANED(hpaned), 230);
+
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_box_append(GTK_BOX(box), paned);
+    gtk_box_append(GTK_BOX(box), hpaned);
     gtk_box_append(GTK_BOX(box), status);
     gtk_window_set_child(GTK_WINDOW(w->window), box);
 
@@ -895,6 +1114,11 @@ static ComposerWindow *composer_window_new(GtkApplication *app, GFile *file)
     g_signal_connect(composer_editor_buffer(w->editor), "changed", G_CALLBACK(on_text_changed), w);
     g_signal_connect(w->interp_toggle, "toggled", G_CALLBACK(on_mode_toggled), w);
     g_signal_connect(w->compile_toggle, "toggled", G_CALLBACK(on_mode_toggled), w);
+    g_signal_connect(w->sidebar_toggle, "toggled", G_CALLBACK(on_sidebar_toggled), w);
+    Settings *st = settings_get();
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(w->sidebar_toggle), st->sidebar);
+    gtk_widget_set_visible(sidebar_widget(w->sidebar), st->sidebar);
+    sidebar_set_project(w->sidebar, st->project_dir);
     g_signal_connect(composer_editor_buffer(w->editor), "modified-changed", G_CALLBACK(on_modified_changed), w);
     g_signal_connect(w->window, "close-request", G_CALLBACK(on_close_request), w);
 
@@ -902,6 +1126,7 @@ static ComposerWindow *composer_window_new(GtkApplication *app, GFile *file)
         composer_editor_set_text(w->editor, templates[0].text);
     update_title(w);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(w->interp_toggle), TRUE);   /* -> set_mode */
+    apply_visual_settings(w);
 
     gtk_window_present(GTK_WINDOW(w->window));
     gtk_widget_grab_focus(GTK_WIDGET(composer_editor_view(w->editor)));
@@ -913,8 +1138,8 @@ static ComposerWindow *composer_window_new(GtkApplication *app, GFile *file)
 static void on_startup(GApplication *app, gpointer data)
 {
     (void)data;
-    theme_install_css();
-    g_object_set(gtk_settings_get_default(), "gtk-application-prefer-dark-theme", TRUE, NULL);
+    if (!theme_apply(settings_get()->theme))       /* CSS, colours, light/dark */
+        theme_apply("c-omposer-dark");
 
     struct { const char *action; const char *accel; } accels[] = {
         { "win.new",     "<Ctrl>n" },
@@ -923,6 +1148,8 @@ static void on_startup(GApplication *app, gpointer data)
         { "win.save-as", "<Ctrl><Shift>s" },
         { "win.run",     "F5" },
         { "win.stop",    "<Shift>F5" },
+        { "win.toggle-sidebar", "F9" },
+        { "win.preferences", "<Ctrl>comma" },
     };
     for (size_t i = 0; i < G_N_ELEMENTS(accels); i++)
         gtk_application_set_accels_for_action(GTK_APPLICATION(app), accels[i].action,
